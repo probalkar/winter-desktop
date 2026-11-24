@@ -1,0 +1,42 @@
+# Build outputs
+build/
+out/
+cmake-build-*/
+x64/
+x86/
+Debug/
+Release/
+
+# Compiled binaries & object files
+*.exe
+*.dll
+*.lib
+*.a
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+
+# CMake & Ninja artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+build.ninja
+.ninja_deps
+.ninja_log
+
+# IDE & Editor files
+.vscode/
+.vs/
+.idea/
+*.sln
+*.vcxproj*
+*.user
+*.suo
+
+# OS & leftover prototype files
+Thumbs.db
+Desktop.ini
+.venv/
+__pycache__/
