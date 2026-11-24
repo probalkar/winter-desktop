@@ -32,31 +32,48 @@ using namespace Gdiplus;
 namespace {
 
 // --- Tuning Constants ---
-constexpr int BUCKET_W = 8;
+constexpr int BUCKET_W = 4;                   // Smooth contour resolution for curved window corners
+constexpr DWORD DEFAULT_IDLE_SEC = 120;       // Default: 2 minutes idle before snowfall starts
+constexpr DWORD MAX_IDLE_SEC = 86400;         // Max configurable idle delay (24 hours)
 constexpr float WINDOW_IDLE_SEC = 4.0f;       // Idle time before a window gathers snow
 constexpr float ACTIVE_CLIP_GRACE_SEC = 4.0f; // Seconds after input before snow crosses active window
-constexpr float BLIZZARD_IDLE_SEC = 180.0f;   // 3 min unattended -> full-screen blizzard
 constexpr float PLOW_TRIGGER_WIN = 14.0f;     // Avg snow depth (px) to summon window plow
 constexpr float PLOW_TRIGGER_TB = 13.0f;      // Avg snow depth (px) to summon taskbar plow
 constexpr float MAX_SNOW_H = 24.0f;
 constexpr float GRAVITY = 900.0f;
-constexpr float BLIZZARD_STRIP_H = 68.0f;
 constexpr float PI_F = 3.14159265f;
+constexpr float STACK_MAX_ANGLE_RAD = 30.0f * PI_F / 180.0f; // +/- 30 deg from vertical Y-axis
 
 constexpr UINT WM_TRAYICON = WM_APP + 1;
 constexpr UINT_PTR TIMER_TICK = 1;
 
 constexpr UINT ID_TRAY_PLOW_WIN = 1001;
 constexpr UINT ID_TRAY_PLOW_TB = 1002;
-constexpr UINT ID_TRAY_BLIZZARD = 1003;
+constexpr UINT ID_TRAY_PENGUINS = 1003;
 constexpr UINT ID_TRAY_SANTA = 1004;
 constexpr UINT ID_TRAY_ECO = 1005;
 constexpr UINT ID_TRAY_CLEAR = 1006;
 constexpr UINT ID_TRAY_QUIT = 1007;
 constexpr UINT ID_TRAY_AUTOSTART = 1008;
+constexpr UINT ID_TRAY_FORCE_SNOW = 1009;
+
+// Idle Timer Submenu IDs
+constexpr UINT ID_IDLE_0 = 1100;
+constexpr UINT ID_IDLE_30 = 1101;
+constexpr UINT ID_IDLE_60 = 1102;
+constexpr UINT ID_IDLE_120 = 1103;
+constexpr UINT ID_IDLE_300 = 1104;
+constexpr UINT ID_IDLE_600 = 1105;
+constexpr UINT ID_IDLE_CUSTOM = 1106;
+
+// Custom Idle Dialog Control IDs
+constexpr int IDC_EDIT_MIN = 2001;
+constexpr int IDC_EDIT_SEC = 2002;
 
 constexpr const wchar_t* REG_RUN_PATH = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr const wchar_t* REG_APP_NAME = L"WinterDesktop";
+constexpr const wchar_t* REG_SETTINGS_PATH = L"Software\\WinterDesktop";
+constexpr const wchar_t* REG_IDLE_VALUE = L"IdleDelaySec";
 
 const HWND TASKBAR_KEY = reinterpret_cast<HWND>(static_cast<intptr_t>(-999));
 
@@ -116,7 +133,16 @@ RECT GetWindowBounds(HWND hwnd) {
     return r;
 }
 
-// --- Windows Startup Registry Helpers ---
+std::wstring FormatIdleDuration(DWORD totalSec) {
+    if (totalSec == 0) return L"Immediate";
+    DWORD mins = totalSec / 60;
+    DWORD secs = totalSec % 60;
+    if (mins > 0 && secs > 0) return std::to_wstring(mins) + L"m " + std::to_wstring(secs) + L"s";
+    if (mins > 0) return std::to_wstring(mins) + L"m";
+    return std::to_wstring(secs) + L"s";
+}
+
+// --- Windows Registry Helpers (Startup & Persistent Settings) ---
 std::wstring GetQuotedExePath() {
     std::wstring buf(MAX_PATH, L'\0');
     while (true) {
@@ -184,6 +210,68 @@ bool SetAutoStart(bool enable) {
     return status == ERROR_SUCCESS;
 }
 
+DWORD LoadIdleDelaySeconds() {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_SETTINGS_PATH, 0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS) {
+        return DEFAULT_IDLE_SEC;
+    }
+    DWORD val = DEFAULT_IDLE_SEC;
+    DWORD type = 0;
+    DWORD size = sizeof(val);
+    if (RegQueryValueExW(hKey, REG_IDLE_VALUE, nullptr, &type, reinterpret_cast<LPBYTE>(&val), &size) != ERROR_SUCCESS ||
+        type != REG_DWORD) {
+        val = DEFAULT_IDLE_SEC;
+    }
+    RegCloseKey(hKey);
+    return std::min(val, MAX_IDLE_SEC);
+}
+
+void SaveIdleDelaySeconds(DWORD seconds) {
+    DWORD clamped = std::min(seconds, MAX_IDLE_SEC);
+    HKEY hKey = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_SETTINGS_PATH, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
+        RegSetValueExW(hKey, REG_IDLE_VALUE, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&clamped), sizeof(clamped));
+        RegCloseKey(hKey);
+    }
+}
+
+// --- Native Custom Idle Timer Dialog (Zero Resource File Needed) ---
+struct IdleDialogState {
+    bool done = false;
+    bool accepted = false;
+    DWORD resultSeconds = DEFAULT_IDLE_SEC;
+};
+
+LRESULT CALLBACK CustomIdleDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* st = reinterpret_cast<IdleDialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+    case WM_COMMAND: {
+        UINT id = LOWORD(wp);
+        if (id == IDOK && st) {
+            UINT mins = GetDlgItemInt(hwnd, IDC_EDIT_MIN, nullptr, FALSE);
+            UINT secs = GetDlgItemInt(hwnd, IDC_EDIT_SEC, nullptr, FALSE);
+            uint64_t total = static_cast<uint64_t>(mins) * 60ULL + static_cast<uint64_t>(secs);
+            st->resultSeconds = static_cast<DWORD>(std::min<uint64_t>(total, MAX_IDLE_SEC));
+            st->accepted = true;
+            st->done = true;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (id == IDCANCEL && st) {
+            st->done = true;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    }
+    case WM_CLOSE:
+        if (st) st->done = true;
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
 // --- Simulation Entities ---
 struct RectFSim {
     float x = 0, y = 0, w = 0, h = 0;
@@ -212,6 +300,12 @@ struct WindowSurface {
         for (float h : heights) sum += h;
         return sum / static_cast<float>(heights.size());
     }
+    bool HasSnow() const {
+        for (float h : heights) {
+            if (h > 0.5f) return true;
+        }
+        return false;
+    }
 };
 
 struct Flake {
@@ -221,6 +315,12 @@ struct Flake {
     float depositAmt = 2.0f;
     HWND ignoreHwnd = nullptr;
     float age = 0.0f;
+};
+
+struct DustParticle {
+    float x = 0, y = 0, vx = 0, vy = 0, r = 2.0f;
+    float life = 0.8f, maxLife = 0.8f;
+    bool icyTint = false;
 };
 
 struct Sparkle {
@@ -236,15 +336,20 @@ struct SnowPlow {
     HWND attachedHwnd = nullptr;
     bool isTaskbarPlow = false;
     float moundMass = 0.0f;
-    bool blizzardMode = false;
-    float blizzardRowY = 0.0f;
 };
 
 struct Snowball {
+    int id = 0;
     float x = 0, y = 0, vx = 0, vy = 0, r = 15.0f;
     bool grabbed = false;
     bool resting = false;
-    int stackLevel = 0;
+    int stackLevel = 0;          // 0 = standalone / snowman body, 1 = snowman head
+    int stackedOnId = -1;        // ID of lower body snowball when stacked
+    bool aligning = false;
+    float alignAngle = 0.0f;     // Signed angle (rad) from vertical Y-axis
+    float snowmanReveal = 0.0f;  // 0..1 smooth fade-in of hat/scarf/face/arms
+    bool collapsing = false;     // True while toppling into snowdust
+    float collapseTimer = 0.0f;
 };
 
 struct SantaSleigh {
@@ -252,11 +357,24 @@ struct SantaSleigh {
     float x = 0, y = 0, baseY = 0, vx = 165.0f, phase = 0.0f;
 };
 
+struct Penguin {
+    float x = 0, y = 0;
+    int dir = 1;           // 1 = left-to-right, -1 = right-to-left
+    float speed = 34.0f;
+    float scale = 1.0f;
+    float waddlePhase = 0.0f;
+    float hopY = 0.0f;
+    float hopVy = 0.0f;
+    float dustTimer = 0.0f;
+};
+
 // --- Main Application ---
 class WinterApp {
 public:
     bool Init(HINSTANCE hInst) {
         hInst_ = hInst;
+        ownPid_ = GetCurrentProcessId();
+        idleDelaySec_ = LoadIdleDelaySeconds();
         SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
 
         WNDCLASSEXW wc{};
@@ -266,6 +384,15 @@ public:
         wc.lpszClassName = L"WinterDesktopOverlayClass";
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         if (!RegisterClassExW(&wc)) return false;
+
+        WNDCLASSEXW dlgWc{};
+        dlgWc.cbSize = sizeof(dlgWc);
+        dlgWc.lpfnWndProc = CustomIdleDlgProc;
+        dlgWc.hInstance = hInst_;
+        dlgWc.lpszClassName = L"WinterDesktopIdleDialogClass";
+        dlgWc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        dlgWc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        RegisterClassExW(&dlgWc);
 
         RefreshMetrics();
 
@@ -280,7 +407,7 @@ public:
 
         InitBuffers();
         CreateTrayIcon();
-        SeedAmbientFlakes();
+        RenderFrame(); // Present initial clean transparent frame
 
         QueryPerformanceFrequency(&qpcFreq_);
         QueryPerformanceCounter(&lastTick_);
@@ -307,6 +434,8 @@ public:
 private:
     HINSTANCE hInst_ = nullptr;
     HWND hwnd_ = nullptr;
+    HWND activeDlg_ = nullptr;
+    DWORD ownPid_ = 0;
     NOTIFYICONDATAW nid_{};
     HICON trayIcon_ = nullptr;
 
@@ -314,6 +443,7 @@ private:
     int fullW_ = 1920, fullH_ = 1080;
     int width_ = 1920, height_ = 1040;
     bool hasBottomTaskbar_ = true;
+    float cornerRadius_ = 10.0f;
 
     // Reusable 32-bit DIB for zero-allocation UpdateLayeredWindow
     HDC memDC_ = nullptr;
@@ -321,43 +451,149 @@ private:
     HGDIOBJ oldBmp_ = nullptr;
     void* dibBits_ = nullptr;
 
-    // Quarter-scale offscreen blizzard blanket
-    static constexpr int BLIZ_SCALE = 4;
-    std::unique_ptr<Bitmap> blizBmp_;
-    bool blizzardActive_ = false;
-    bool blizzardClearing_ = false;
-    float blizzardFillY_ = 0.0f;
-    bool wasGloballyIdle_ = false;
-
     // State
     bool clickThrough_ = true;
     bool paused_ = false;
     bool ecoMode_ = false;
+    DWORD idleDelaySec_ = DEFAULT_IDLE_SEC;
+    bool forceSnowfall_ = false;  // Temporary override toggle
+    bool snowfallActive_ = false;
+    bool lastFrameHadContent_ = false;
     bool hasActiveWindowClip_ = false;
     RectFSim activeWindowClip_{};
 
     std::unordered_map<HWND, WindowSurface> surfaces_;
     std::vector<HWND> zOrder_;
     std::vector<Flake> flakes_;
+    std::vector<DustParticle> dust_;
     std::vector<Sparkle> sparkles_;
     std::vector<SnowPlow> plows_;
     std::vector<Snowball> snowballs_;
+    std::vector<Penguin> penguins_;
+    int nextBallId_ = 1;
     SantaSleigh santa_;
-    float santaCooldown_ = 28.0f;
+    float santaCooldown_ = 30.0f;
+    float penguinCooldown_ = 22.0f;
 
-    int draggedIdx_ = -1;
+    int draggedBallId_ = -1;
     POINT lastMouse_{};
     float mouseVx_ = 0.0f, mouseVy_ = 0.0f;
 
     LARGE_INTEGER qpcFreq_{}, lastTick_{};
     float pollAccum_ = 0.4f;
     float hoverAccum_ = 0.0f;
+    float relaxAccum_ = 0.0f;
     float elapsedSec_ = 0.0f;
+    float ambientSpawnAccum_ = 0.0f;
 
     std::vector<PointF> polyBuf_;
 
     UINT TargetFrameMs() const { return ecoMode_ ? 50 : 33; } // 20 FPS eco / 30 FPS normal
     size_t TargetAmbientCount() const { return ecoMode_ ? 36 : 58; }
+
+    void RefreshSnowfallActive(float globalIdle) {
+        snowfallActive_ = forceSnowfall_ || (idleDelaySec_ == 0) ||
+                          (globalIdle >= static_cast<float>(idleDelaySec_));
+    }
+
+    void ApplyIdleDelay(DWORD newSeconds) {
+        idleDelaySec_ = std::min(newSeconds, MAX_IDLE_SEC);
+        SaveIdleDelaySeconds(idleDelaySec_);
+        RefreshSnowfallActive(GetGlobalIdleSeconds());
+    }
+
+    void ShowCustomIdleDialog() {
+        if (activeDlg_ && IsWindow(activeDlg_)) {
+            SetForegroundWindow(activeDlg_);
+            return;
+        }
+
+        HDC screenDC = GetDC(nullptr);
+        int dpi = GetDeviceCaps(screenDC, LOGPIXELSX);
+        ReleaseDC(nullptr, screenDC);
+        auto sc = [dpi](int px) { return MulDiv(px, dpi, 96); };
+
+        int dlgW = sc(320);
+        int dlgH = sc(178);
+        int cx = workArea_.left + (width_ - dlgW) / 2;
+        int cy = workArea_.top + (height_ - dlgH) / 2;
+
+        IdleDialogState state{};
+        state.resultSeconds = idleDelaySec_;
+
+        HWND dlg = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
+            L"WinterDesktopIdleDialogClass",
+            L"Custom Idle Timer - Winter Desktop",
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            cx, cy, dlgW, dlgH,
+            nullptr, nullptr, hInst_, nullptr
+        );
+        if (!dlg) return;
+
+        activeDlg_ = dlg;
+        SetWindowLongPtrW(dlg, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&state));
+
+        NONCLIENTMETRICSW ncm{};
+        ncm.cbSize = sizeof(ncm);
+        HFONT hFont = nullptr;
+        if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
+            hFont = CreateFontIndirectW(&ncm.lfMessageFont);
+        }
+        HFONT useFont = hFont ? hFont : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+
+        auto addCtrl = [&](const wchar_t* cls, const wchar_t* text, DWORD style,
+                           int x, int y, int w, int h, int id) -> HWND {
+            HWND c = CreateWindowExW(
+                0, cls, text, WS_CHILD | WS_VISIBLE | style,
+                sc(x), sc(y), sc(w), sc(h),
+                dlg, reinterpret_cast<HMENU>(static_cast<intptr_t>(id)), hInst_, nullptr
+            );
+            SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(useFont), TRUE);
+            return c;
+        };
+
+        addCtrl(L"STATIC", L"Start snowfall after system is idle for:", 0, 16, 14, 275, 20, 0);
+
+        std::wstring initMin = std::to_wstring(idleDelaySec_ / 60);
+        std::wstring initSec = std::to_wstring(idleDelaySec_ % 60);
+
+        HWND editMin = addCtrl(L"EDIT", initMin.c_str(),
+            WS_BORDER | WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL, 16, 40, 64, 24, IDC_EDIT_MIN);
+        addCtrl(L"STATIC", L"min", 0, 86, 44, 34, 20, 0);
+
+        addCtrl(L"EDIT", initSec.c_str(),
+            WS_BORDER | WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL, 132, 40, 64, 24, IDC_EDIT_SEC);
+        addCtrl(L"STATIC", L"sec", 0, 202, 44, 34, 20, 0);
+
+        addCtrl(L"STATIC", L"Tip: Set 0 min 0 sec for immediate snowfall.", 0, 16, 74, 275, 18, 0);
+
+        addCtrl(L"BUTTON", L"Save", WS_TABSTOP | BS_DEFPUSHBUTTON, 130, 104, 76, 28, IDOK);
+        addCtrl(L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON, 214, 104, 76, 28, IDCANCEL);
+
+        ShowWindow(dlg, SW_SHOW);
+        SetForegroundWindow(dlg);
+        SetFocus(editMin);
+        SendMessageW(editMin, EM_SETSEL, 0, -1);
+
+        MSG msg{};
+        while (!state.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            if (!IsDialogMessageW(dlg, &msg)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        if (msg.message == WM_QUIT) {
+            PostQuitMessage(static_cast<int>(msg.wParam));
+        }
+
+        activeDlg_ = nullptr;
+        if (hFont) DeleteObject(hFont);
+
+        if (state.accepted) {
+            ApplyIdleDelay(state.resultSeconds);
+        }
+    }
 
     void RefreshMetrics() {
         fullW_ = GetSystemMetrics(SM_CXSCREEN);
@@ -366,6 +602,11 @@ private:
         width_ = std::max(1, static_cast<int>(workArea_.right - workArea_.left));
         height_ = std::max(1, static_cast<int>(workArea_.bottom - workArea_.top));
         hasBottomTaskbar_ = (workArea_.bottom < fullH_ - 2);
+
+        HDC screenDC = GetDC(nullptr);
+        int dpiX = GetDeviceCaps(screenDC, LOGPIXELSX);
+        ReleaseDC(nullptr, screenDC);
+        cornerRadius_ = std::max(8.0f, 8.5f * (static_cast<float>(dpiX) / 96.0f));
     }
 
     void InitBuffers() {
@@ -384,15 +625,9 @@ private:
 
         dibBmp_ = CreateDIBSection(memDC_, &bmi, DIB_RGB_COLORS, &dibBits_, nullptr, 0);
         oldBmp_ = SelectObject(memDC_, dibBmp_);
-
-        int bw = std::max(1, width_ / BLIZ_SCALE);
-        int bh = std::max(1, height_ / BLIZ_SCALE);
-        blizBmp_ = std::make_unique<Bitmap>(bw, bh, PixelFormat32bppPARGB);
-        ClearBlizzardBitmap();
     }
 
     void DestroyBuffers() {
-        blizBmp_.reset();
         if (memDC_) {
             if (oldBmp_) SelectObject(memDC_, oldBmp_);
             if (dibBmp_) DeleteObject(dibBmp_);
@@ -446,11 +681,11 @@ private:
         if (shouldPause == paused_) return;
         paused_ = shouldPause;
         if (paused_) {
-            draggedIdx_ = -1;
+            draggedBallId_ = -1;
             ReleaseCapture();
             SetClickThrough(true);
             ShowWindow(hwnd_, SW_HIDE);
-            SetTimer(hwnd_, TIMER_TICK, 400, nullptr); // ~0% CPU sleep
+            SetTimer(hwnd_, TIMER_TICK, 400, nullptr);
         } else {
             QueryPerformanceCounter(&lastTick_);
             ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
@@ -458,10 +693,75 @@ private:
         }
     }
 
+    // --- Curved Window Corner Profile Helpers ---
+    float CornerDropAt(const WindowSurface& s, float localX) const {
+        if (s.isTaskbar) return 0.0f;
+        float r = std::min(cornerRadius_, s.rect.w * 0.25f);
+        float edgeDist = std::min(localX, s.rect.w - localX);
+        if (edgeDist >= r) return 0.0f;
+        float dx = r - std::max(0.0f, edgeDist);
+        return r - std::sqrt(std::max(0.0f, r * r - dx * dx));
+    }
+
+    float MaxSnowHeightAt(const WindowSurface& s, float localX) const {
+        if (s.isTaskbar) return MAX_SNOW_H;
+        float r = std::min(cornerRadius_, s.rect.w * 0.25f);
+        float edgeDist = std::min(localX, s.rect.w - localX);
+        float slipZone = r * 0.60f;
+        float taperEnd = r * 2.40f;
+        if (edgeDist <= slipZone) return 0.0f;
+        if (edgeDist >= taperEnd) return MAX_SNOW_H;
+        float t = (edgeDist - slipZone) / (taperEnd - slipZone);
+        float smooth = t * t * (3.0f - 2.0f * t);
+        return MAX_SNOW_H * smooth;
+    }
+
+    void SpawnCornerSlideDust(float x, float y, int sideDir, int count) {
+        for (int i = 0; i < count && dust_.size() < 260; ++i) {
+            float life = RandRange(0.45f, 1.05f);
+            dust_.push_back({
+                x + RandRange(-1.5f, 1.5f),
+                y + RandRange(-1.0f, 2.0f),
+                sideDir * RandRange(16.0f, 48.0f),
+                RandRange(18.0f, 65.0f),
+                RandRange(1.2f, 2.6f),
+                life,
+                life,
+                RandInt(0, 2) == 0
+            });
+        }
+    }
+
+    // --- Snowball Lookup Helpers ---
+    int FindBallIndexById(int id) const {
+        if (id < 0) return -1;
+        for (size_t i = 0; i < snowballs_.size(); ++i) {
+            if (snowballs_[i].id == id) return static_cast<int>(i);
+        }
+        return -1;
+    }
+
+    int FindStackedChildIndex(int parentId) const {
+        if (parentId < 0) return -1;
+        for (size_t i = 0; i < snowballs_.size(); ++i) {
+            if (snowballs_[i].stackedOnId == parentId && !snowballs_[i].collapsing) {
+                return static_cast<int>(i);
+            }
+        }
+        return -1;
+    }
+
+    bool IsPartOfSnowman(int idx) const {
+        if (idx < 0 || idx >= static_cast<int>(snowballs_.size())) return false;
+        const auto& b = snowballs_[idx];
+        if (b.collapsing) return false;
+        return (b.stackedOnId >= 0) || (FindStackedChildIndex(b.id) >= 0);
+    }
+
     Flake MakeAmbientFlake(bool randomY) {
         Flake f;
         f.x = RandRange(0.0f, static_cast<float>(width_));
-        f.y = randomY ? RandRange(0.0f, static_cast<float>(height_)) : RandRange(-20.0f, 0.0f);
+        f.y = randomY ? RandRange(0.0f, static_cast<float>(height_)) : RandRange(-20.0f, -2.0f);
         f.vx = RandRange(-18.0f, 18.0f);
         f.vy = RandRange(45.0f, 95.0f);
         f.r = RandRange(1.7f, 3.6f);
@@ -471,62 +771,18 @@ private:
         return f;
     }
 
-    void SeedAmbientFlakes() {
-        flakes_.clear();
-        size_t n = TargetAmbientCount();
-        flakes_.reserve(n + 120);
-        for (size_t i = 0; i < n; ++i) flakes_.push_back(MakeAmbientFlake(true));
-    }
-
-    void ClearBlizzardBitmap() {
-        if (!blizBmp_) return;
-        Graphics g(blizBmp_.get());
-        g.Clear(Color(0, 0, 0, 0));
-    }
-
-    void PaintFullBlizzard() {
-        if (!blizBmp_) return;
-        Graphics g(blizBmp_.get());
-        g.Clear(Color(238, 242, 248, 255));
-    }
-
-    void CarveBlizzardTunnel(float xCenter, float yBottom, float w) {
-        if (!blizBmp_) return;
-        Graphics g(blizBmp_.get());
-        g.SetCompositingMode(CompositingModeSourceCopy);
-        SolidBrush erase(Color(0, 0, 0, 0));
-        g.FillRectangle(
-            &erase,
-            (xCenter - w * 0.5f) / BLIZ_SCALE,
-            (yBottom - BLIZZARD_STRIP_H) / BLIZ_SCALE,
-            w / BLIZ_SCALE,
-            (BLIZZARD_STRIP_H + 4.0f) / BLIZ_SCALE
-        );
-    }
-
-    void StartBlizzardClear() {
-        if (blizzardClearing_) return;
-        blizzardClearing_ = true;
-        SnowPlow p;
-        p.x = -40.0f;
-        p.y = static_cast<float>(height_);
-        p.dir = 1;
-        p.speed = 540.0f;
-        p.blizzardMode = true;
-        p.blizzardRowY = static_cast<float>(height_);
-        plows_.push_back(p);
-    }
-
     // --- Window Enumeration & Topmost Z-Order Precedence ---
     struct EnumCtx {
-        HWND ownHwnd;
+        DWORD ownPid;
         RECT workArea;
         std::vector<std::pair<HWND, RectFSim>> list;
     };
 
     static BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
         auto* ctx = reinterpret_cast<EnumCtx*>(lParam);
-        if (hwnd == ctx->ownHwnd || !IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == ctx->ownPid || !IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
         if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
 
         int cloaked = 0;
@@ -566,15 +822,16 @@ private:
         }
 
         HWND fg = GetForegroundWindow();
-        if (!fg || fg == hwnd_ || IsIconic(fg) || IsIgnoredClass(fg)) return;
+        if (!fg || IsIconic(fg) || IsIgnoredClass(fg)) return;
+        DWORD fgPid = 0;
+        GetWindowThreadProcessId(fg, &fgPid);
+        if (fgPid == ownPid_) return;
 
         RECT r = GetWindowBounds(fg);
-        // True borderless fullscreen (F11 / video / game)
         if (r.left <= 4 && r.top <= 4 && r.right >= fullW_ - 4 && r.bottom >= fullH_ - 4) {
             outShouldPause = true;
             return;
         }
-        // Maximized window or >= 94% of work area -> pause completely
         if (IsZoomed(fg)) {
             outShouldPause = true;
             return;
@@ -587,7 +844,6 @@ private:
             return;
         }
 
-        // Windowed focused app: exclude snowfall through it while user is active
         if (globalIdle < ACTIVE_CLIP_GRACE_SEC) {
             hasActiveWindowClip_ = true;
             activeWindowClip_ = {
@@ -605,17 +861,19 @@ private:
             float h = surf.heights[i];
             if (h > 1.5f) {
                 hadSnow = true;
-                Flake f;
-                f.x = surf.rect.Left() + static_cast<float>(i * BUCKET_W) + RandRange(-2.0f, 2.0f);
-                f.y = surf.rect.Top() - RandRange(0.0f, h);
-                f.vx = std::clamp(dx * 3.0f, -130.0f, 130.0f) + RandRange(-30.0f, 30.0f);
-                f.vy = std::clamp(dy * 2.0f, -60.0f, 90.0f) + RandRange(-20.0f, 25.0f);
-                f.r = RandRange(2.4f, 4.4f);
-                f.ambient = false;
-                f.canDeposit = true;
-                f.depositAmt = std::min(5.0f, h * 0.65f);
-                f.ignoreHwnd = surf.hwnd;
-                flakes_.push_back(f);
+                if (i % 2 == 0 && flakes_.size() < 260) {
+                    Flake f;
+                    f.x = surf.rect.Left() + static_cast<float>(i * BUCKET_W) + RandRange(-2.0f, 2.0f);
+                    f.y = surf.rect.Top() - RandRange(0.0f, h);
+                    f.vx = std::clamp(dx * 3.0f, -130.0f, 130.0f) + RandRange(-30.0f, 30.0f);
+                    f.vy = std::clamp(dy * 2.0f, -60.0f, 90.0f) + RandRange(-20.0f, 25.0f);
+                    f.r = RandRange(2.4f, 4.4f);
+                    f.ambient = false;
+                    f.canDeposit = true;
+                    f.depositAmt = std::min(5.0f, h * 0.75f);
+                    f.ignoreHwnd = surf.hwnd;
+                    flakes_.push_back(f);
+                }
             }
         }
         if (hadSnow) std::fill(surf.heights.begin(), surf.heights.end(), 0.0f);
@@ -625,29 +883,18 @@ private:
         float globalIdle = GetGlobalIdleSeconds();
         bool shouldPause = false;
         CheckFullscreenAndActiveClip(globalIdle, shouldPause);
-        if (shouldPause && !blizzardClearing_) {
+        if (shouldPause) {
             SetPaused(true);
             return;
         }
         SetPaused(false);
 
-        // Full-screen unattended blizzard trigger & wake-clear
-        if (globalIdle >= BLIZZARD_IDLE_SEC && !blizzardActive_) {
-            blizzardActive_ = true;
-            blizzardClearing_ = false;
-            blizzardFillY_ = static_cast<float>(height_);
-            wasGloballyIdle_ = true;
-        } else if (wasGloballyIdle_ && globalIdle < 1.5f && blizzardActive_ && !blizzardClearing_) {
-            StartBlizzardClear();
-            wasGloballyIdle_ = false;
-        }
+        RefreshSnowfallActive(globalIdle);
 
         HWND fg = GetForegroundWindow();
-        EnumCtx ctx{ hwnd_, workArea_, {} };
+        EnumCtx ctx{ ownPid_, workArea_, {} };
         EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(&ctx));
 
-        // 1. Taskbar is always active and independent.
-        // 2. Strict Z-order precedence: skip windows whose top edge is occluded by a higher-Z window.
         std::vector<std::pair<HWND, RectFSim>> eligible;
         if (hasBottomTaskbar_) {
             eligible.push_back({ TASKBAR_KEY, RectFSim{ 0.0f, static_cast<float>(height_), static_cast<float>(width_), 40.0f } });
@@ -705,7 +952,6 @@ private:
             }
         }
 
-        // Closed, minimized, or newly-occluded windows spill snow downward
         for (auto it = surfaces_.begin(); it != surfaces_.end(); ) {
             if (activeSet.find(it->first) == activeSet.end()) {
                 SpillWindowSnow(it->second, 0.0f, 15.0f);
@@ -716,10 +962,10 @@ private:
         }
     }
 
-    // --- Plow Spawning ---
+    // --- Plow, Santa & Penguin Spawning ---
     void SpawnPlowForSurface(const WindowSurface& surf) {
         for (const auto& p : plows_) {
-            if (!p.blizzardMode && p.attachedHwnd == surf.hwnd) return;
+            if (p.attachedHwnd == surf.hwnd) return;
         }
         SnowPlow pl;
         pl.x = surf.rect.Left() - 10.0f;
@@ -762,18 +1008,40 @@ private:
         santa_.phase = 0.0f;
     }
 
+    void SummonPenguinGroup() {
+        if (paused_ || !hasBottomTaskbar_) return;
+        int count = RandInt(4, 5);
+        int dir = (RandInt(0, 1) == 0) ? 1 : -1;
+        float baseSpeed = RandRange(28.0f, 38.0f);
+        float startX = (dir == 1) ? -22.0f : static_cast<float>(width_) + 22.0f;
+
+        float cursor = startX;
+        for (int i = 0; i < count; ++i) {
+            Penguin pg;
+            pg.x = cursor;
+            pg.y = static_cast<float>(height_);
+            pg.dir = dir;
+            pg.speed = baseSpeed;
+            pg.scale = (i == 0) ? RandRange(0.96f, 1.05f) : RandRange(0.76f, 1.02f);
+            pg.waddlePhase = RandRange(0.0f, 2.0f * PI_F);
+            pg.dustTimer = RandRange(0.15f, 0.45f);
+            penguins_.push_back(pg);
+            cursor -= dir * RandRange(27.0f, 35.0f);
+        }
+    }
+
     void ClearAllSnow() {
         for (auto& [_, s] : surfaces_) std::fill(s.heights.begin(), s.heights.end(), 0.0f);
         snowballs_.clear();
         plows_.clear();
-        blizzardActive_ = false;
-        blizzardClearing_ = false;
-        ClearBlizzardBitmap();
+        penguins_.clear();
+        dust_.clear();
+        flakes_.clear();
     }
 
     // --- Dynamic Click-Through Hit Test ---
     void UpdateClickThrough() {
-        if (draggedIdx_ >= 0) {
+        if (draggedBallId_ >= 0) {
             SetClickThrough(false);
             return;
         }
@@ -788,6 +1056,7 @@ private:
         float my = static_cast<float>(pt.y - workArea_.top);
 
         for (const auto& b : snowballs_) {
+            if (b.collapsing) continue;
             if (std::hypot(mx - b.x, my - b.y) <= b.r + 8.0f) {
                 SetClickThrough(false);
                 return;
@@ -806,7 +1075,7 @@ private:
         SetClickThrough(true);
     }
 
-    // --- Physics & Simulation ---
+    // --- Snowball Splat, Snowdust & Collapse ---
     void SplatSnowball(const Snowball& b) {
         for (int i = 0; i < 12; ++i) {
             float ang = RandRange(0.0f, 2.0f * PI_F);
@@ -821,6 +1090,125 @@ private:
             f.canDeposit = true;
             f.depositAmt = 2.0f;
             flakes_.push_back(f);
+        }
+    }
+
+    void BurstIntoSnowdust(const Snowball& b) {
+        for (int i = 0; i < 24 && dust_.size() < 260; ++i) {
+            float ang = RandRange(0.0f, 2.0f * PI_F);
+            float spd = RandRange(35.0f, 195.0f);
+            float life = RandRange(0.55f, 1.25f);
+            dust_.push_back({
+                b.x + RandRange(-b.r * 0.45f, b.r * 0.45f),
+                b.y + RandRange(-b.r * 0.45f, b.r * 0.45f),
+                std::cos(ang) * spd,
+                std::sin(ang) * spd - RandRange(25.0f, 80.0f),
+                RandRange(1.4f, 3.6f),
+                life,
+                life,
+                RandInt(0, 2) == 0
+            });
+        }
+        for (int i = 0; i < 6 && flakes_.size() < 240; ++i) {
+            float ang = RandRange(0.0f, 2.0f * PI_F);
+            float spd = RandRange(45.0f, 140.0f);
+            Flake f;
+            f.x = b.x;
+            f.y = b.y;
+            f.vx = std::cos(ang) * spd;
+            f.vy = std::sin(ang) * spd - 40.0f;
+            f.r = RandRange(1.8f, 3.2f);
+            f.ambient = false;
+            f.canDeposit = true;
+            f.depositAmt = 1.4f;
+            flakes_.push_back(f);
+        }
+    }
+
+    void TriggerSnowmanCollapse(int incomingIdx, int snowmanMemberIdx) {
+        int bodyIdx = -1;
+        int headIdx = -1;
+        const auto& member = snowballs_[snowmanMemberIdx];
+        if (member.stackedOnId >= 0) {
+            headIdx = snowmanMemberIdx;
+            bodyIdx = FindBallIndexById(member.stackedOnId);
+        } else {
+            bodyIdx = snowmanMemberIdx;
+            headIdx = FindStackedChildIndex(member.id);
+        }
+
+        auto startCollapse = [&](int idx, float pushDir, float upKick, float timer) {
+            if (idx < 0 || idx >= static_cast<int>(snowballs_.size())) return;
+            auto& b = snowballs_[idx];
+            if (b.collapsing) return;
+            b.collapsing = true;
+            b.collapseTimer = timer;
+            b.grabbed = false;
+            b.resting = false;
+            b.stackedOnId = -1;
+            b.stackLevel = 0;
+            b.aligning = false;
+            b.snowmanReveal = 0.0f;
+            b.vx = pushDir * RandRange(70.0f, 155.0f);
+            b.vy = -upKick;
+        };
+
+        float dir = (snowballs_[incomingIdx].x >= snowballs_[snowmanMemberIdx].x) ? 1.0f : -1.0f;
+        startCollapse(incomingIdx, dir, RandRange(40.0f, 110.0f), 0.34f);
+        startCollapse(headIdx, -dir, RandRange(70.0f, 130.0f), 0.38f);
+        startCollapse(bodyIdx, dir * 0.5f, RandRange(90.0f, 145.0f), 0.32f);
+    }
+
+    bool HasVisualContent() const {
+        if (santa_.active || !flakes_.empty() || !dust_.empty() ||
+            !sparkles_.empty() || !plows_.empty() || !snowballs_.empty() || !penguins_.empty()) {
+            return true;
+        }
+        for (const auto& [_, s] : surfaces_) {
+            if (s.HasSnow()) return true;
+        }
+        return false;
+    }
+
+    void RelaxSnowbanks() {
+        for (auto& [_, s] : surfaces_) {
+            size_t n = s.heights.size();
+            if (n < 3 || !s.HasSnow()) continue;
+
+            for (size_t i = 0; i + 1 < n; ++i) {
+                float diff = s.heights[i] - s.heights[i + 1];
+                if (std::abs(diff) > 2.2f) {
+                    float flow = diff * 0.22f;
+                    s.heights[i] -= flow;
+                    s.heights[i + 1] += flow;
+                }
+            }
+
+            if (s.isTaskbar) continue;
+
+            for (size_t i = 0; i < n; ++i) {
+                float localX = (static_cast<float>(i) + 0.5f) * BUCKET_W;
+                if (localX > cornerRadius_ * 2.5f && (s.rect.w - localX) > cornerRadius_ * 2.5f) {
+                    continue;
+                }
+                float maxH = MaxSnowHeightAt(s, localX);
+                if (s.heights[i] > maxH) {
+                    float overflow = s.heights[i] - maxH;
+                    s.heights[i] = maxH;
+                    if (overflow > 0.15f) {
+                        int sideDir = (localX < s.rect.w * 0.5f) ? -1 : 1;
+                        float worldX = s.rect.Left() + localX;
+                        float worldY = s.rect.Top() + CornerDropAt(s, localX) - maxH;
+                        SpawnCornerSlideDust(worldX, worldY, sideDir, (overflow > 0.8f) ? 2 : 1);
+                    }
+                } else if (s.heights[i] > 1.8f && RandRange(0.0f, 1.0f) < 0.04f) {
+                    int sideDir = (localX < s.rect.w * 0.5f) ? -1 : 1;
+                    float worldX = s.rect.Left() + localX;
+                    float worldY = s.rect.Top() + CornerDropAt(s, localX) - s.heights[i] * 0.5f;
+                    s.heights[i] = std::max(0.0f, s.heights[i] - 0.12f);
+                    SpawnCornerSlideDust(worldX, worldY, sideDir, 1);
+                }
+            }
         }
     }
 
@@ -845,36 +1233,52 @@ private:
         }
 
         hoverAccum_ += dt;
-        if (draggedIdx_ >= 0 || hoverAccum_ >= 0.08f) {
+        if (draggedBallId_ >= 0 || hoverAccum_ >= 0.08f) {
             UpdateClickThrough();
             hoverAccum_ = 0.0f;
         }
 
-        UpdateBlizzardRise(dt);
         UpdateFlakes(dt);
+
+        relaxAccum_ += dt;
+        if (relaxAccum_ >= 0.10f) {
+            RelaxSnowbanks();
+            relaxAccum_ = 0.0f;
+        }
+
+        UpdateDust(dt);
         UpdatePlows(dt);
+        UpdatePenguins(dt);
         UpdateSnowballs(dt);
         UpdateSanta(dt);
         UpdateSparkles(dt);
-        RenderFrame();
-    }
 
-    void UpdateBlizzardRise(float dt) {
-        if (blizzardActive_ && !blizzardClearing_ && blizzardFillY_ > 0.0f && blizBmp_) {
-            float oldY = blizzardFillY_;
-            blizzardFillY_ = std::max(0.0f, blizzardFillY_ - 150.0f * dt);
-            Graphics g(blizBmp_.get());
-            g.SetCompositingMode(CompositingModeSourceCopy);
-            SolidBrush br(Color(238, 242, 248, 255));
-            g.FillRectangle(
-                &br, 0.0f, blizzardFillY_ / BLIZ_SCALE,
-                static_cast<float>(blizBmp_->GetWidth()),
-                (oldY - blizzardFillY_ + 4.0f) / BLIZ_SCALE
-            );
+        bool hasContent = HasVisualContent();
+        if (hasContent || lastFrameHadContent_) {
+            RenderFrame();
+            lastFrameHadContent_ = hasContent;
         }
     }
 
     void UpdateFlakes(float dt) {
+        if (snowfallActive_) {
+            size_t ambientCount = 0;
+            for (const auto& f : flakes_) {
+                if (f.ambient) ++ambientCount;
+            }
+            size_t target = TargetAmbientCount();
+            if (ambientCount < target) {
+                ambientSpawnAccum_ += dt * 14.0f;
+                while (ambientSpawnAccum_ >= 1.0f && ambientCount < target) {
+                    flakes_.push_back(MakeAmbientFlake(false));
+                    ambientSpawnAccum_ -= 1.0f;
+                    ++ambientCount;
+                }
+            }
+        } else {
+            ambientSpawnAccum_ = 0.0f;
+        }
+
         std::vector<Flake> next;
         next.reserve(flakes_.size());
 
@@ -899,16 +1303,33 @@ private:
                     if (f.ambient && !s.isTaskbar && s.idleTime < WINDOW_IDLE_SEC) continue;
 
                     if (f.x >= s.rect.Left() && f.x <= s.rect.Right()) {
-                        int idx = static_cast<int>((f.x - s.rect.Left()) / BUCKET_W);
+                        float localX = f.x - s.rect.Left();
+                        int idx = static_cast<int>(localX / BUCKET_W);
                         if (idx >= 0 && idx < static_cast<int>(s.heights.size())) {
-                            float snowTop = s.rect.Top() - s.heights[idx];
-                            if (f.y >= snowTop - 6.0f && f.y <= s.rect.Top() + 10.0f) {
-                                const int offs[3] = { -1, 0, 1 };
-                                const float wts[3] = { 0.45f, 1.0f, 0.45f };
-                                for (int k = 0; k < 3; ++k) {
+                            float edgeY = s.rect.Top() + CornerDropAt(s, localX);
+                            float snowTop = edgeY - s.heights[idx];
+                            if (f.y >= snowTop - 6.0f && f.y <= edgeY + 10.0f) {
+                                float maxHere = MaxSnowHeightAt(s, localX);
+                                if (!s.isTaskbar && maxHere < 1.2f) {
+                                    int sideDir = (localX < s.rect.w * 0.5f) ? -1 : 1;
+                                    SpawnCornerSlideDust(f.x, edgeY, sideDir, 2);
+                                    landed = true;
+                                    break;
+                                }
+
+                                const int offs[5] = { -2, -1, 0, 1, 2 };
+                                const float wts[5] = { 0.22f, 0.55f, 0.90f, 0.55f, 0.22f };
+                                for (int k = 0; k < 5; ++k) {
                                     int bi = idx + offs[k];
                                     if (bi >= 0 && bi < static_cast<int>(s.heights.size())) {
-                                        s.heights[bi] = std::min(MAX_SNOW_H, s.heights[bi] + f.depositAmt * wts[k]);
+                                        float bx = (static_cast<float>(bi) + 0.5f) * BUCKET_W;
+                                        float cap = MaxSnowHeightAt(s, bx);
+                                        float added = s.heights[bi] + f.depositAmt * wts[k];
+                                        if (added > cap && !s.isTaskbar && cap < MAX_SNOW_H * 0.9f) {
+                                            int sideDir = (bx < s.rect.w * 0.5f) ? -1 : 1;
+                                            SpawnCornerSlideDust(s.rect.Left() + bx, s.rect.Top() + CornerDropAt(s, bx) - cap, sideDir, 1);
+                                        }
+                                        s.heights[bi] = std::min(cap, added);
                                     }
                                 }
                                 landed = true;
@@ -920,23 +1341,20 @@ private:
             }
 
             if (landed || f.y > height_ + 20 || f.x < -40 || f.x > width_ + 40) {
-                if (f.ambient) next.push_back(MakeAmbientFlake(false));
+                if (f.ambient && snowfallActive_) {
+                    next.push_back(MakeAmbientFlake(false));
+                }
             } else if (next.size() < 240) {
                 next.push_back(f);
             }
         }
         flakes_.swap(next);
 
-        if (blizzardActive_) return;
-
-        // 1. Independent auto-plow for the TASKBAR
         bool hasTbPlow = false;
         bool hasWinPlow = false;
         for (const auto& p : plows_) {
-            if (!p.blizzardMode) {
-                if (p.isTaskbarPlow) hasTbPlow = true;
-                else hasWinPlow = true;
-            }
+            if (p.isTaskbarPlow) hasTbPlow = true;
+            else hasWinPlow = true;
         }
 
         if (!hasTbPlow) {
@@ -946,7 +1364,6 @@ private:
             }
         }
 
-        // 2. Auto-plow for the topmost snow-eligible window
         if (!hasWinPlow) {
             for (HWND h : zOrder_) {
                 if (h == TASKBAR_KEY) continue;
@@ -959,9 +1376,95 @@ private:
         }
     }
 
+    void UpdateDust(float dt) {
+        if (dust_.empty()) return;
+        std::vector<DustParticle> alive;
+        alive.reserve(dust_.size());
+        for (auto d : dust_) {
+            d.life -= dt;
+            if (d.life > 0.0f) {
+                d.vx *= 0.95f;
+                d.vy = d.vy * 0.96f + 135.0f * dt;
+                d.x += d.vx * dt;
+                d.y += d.vy * dt;
+                alive.push_back(d);
+            }
+        }
+        dust_.swap(alive);
+    }
+
+    void UpdatePenguins(float dt) {
+        if (penguins_.empty()) {
+            if (hasBottomTaskbar_ && snowfallActive_) {
+                penguinCooldown_ -= dt;
+                if (penguinCooldown_ <= 0.0f) {
+                    SummonPenguinGroup();
+                    penguinCooldown_ = RandRange(55.0f, 115.0f);
+                }
+            }
+            return;
+        }
+
+        auto tbIt = surfaces_.find(TASKBAR_KEY);
+        std::vector<Penguin> alive;
+        alive.reserve(penguins_.size());
+
+        for (auto pg : penguins_) {
+            pg.waddlePhase += dt * (6.2f / pg.scale);
+            pg.x += pg.dir * pg.speed * dt;
+            pg.y = static_cast<float>(height_);
+
+            if (tbIt != surfaces_.end()) {
+                auto& tb = tbIt->second;
+                int idx = static_cast<int>((pg.x - tb.rect.Left()) / BUCKET_W);
+                if (idx >= 0 && idx < static_cast<int>(tb.heights.size())) {
+                    float sh = tb.heights[idx];
+                    if (sh > 2.0f) {
+                        pg.y = static_cast<float>(height_) - std::min(5.0f, sh * 0.30f);
+                        pg.dustTimer -= dt;
+                        if (pg.dustTimer <= 0.0f && dust_.size() < 260) {
+                            pg.dustTimer = RandRange(0.28f, 0.55f);
+                            float life = RandRange(0.35f, 0.65f);
+                            dust_.push_back({
+                                pg.x - pg.dir * 4.0f,
+                                pg.y - 2.0f,
+                                -pg.dir * RandRange(12.0f, 30.0f),
+                                -RandRange(22.0f, 48.0f),
+                                RandRange(1.2f, 2.2f),
+                                life, life, false
+                            });
+                        }
+                    }
+                }
+            }
+
+            if (pg.hopY == 0.0f && pg.hopVy == 0.0f) {
+                for (const auto& pl : plows_) {
+                    if (pl.isTaskbarPlow && std::abs(pl.x - pg.x) < 42.0f) {
+                        pg.hopVy = -270.0f;
+                        break;
+                    }
+                }
+            }
+            if (pg.hopY < 0.0f || pg.hopVy != 0.0f) {
+                pg.hopVy += GRAVITY * 0.85f * dt;
+                pg.hopY += pg.hopVy * dt;
+                if (pg.hopY >= 0.0f) {
+                    pg.hopY = 0.0f;
+                    pg.hopVy = 0.0f;
+                }
+            }
+
+            bool finished = (pg.dir == 1 && pg.x > width_ + 48.0f) || (pg.dir == -1 && pg.x < -48.0f);
+            if (!finished) alive.push_back(pg);
+        }
+
+        penguins_.swap(alive);
+    }
+
     void TossSnowmenNearPlow(const SnowPlow& pl) {
         for (auto& b : snowballs_) {
-            if (b.grabbed) continue;
+            if (b.grabbed || b.collapsing) continue;
             float dx = b.x - pl.x;
             bool inBladeX = (pl.dir == 1) ? (dx > -18.0f && dx < 46.0f) : (dx < 18.0f && dx > -46.0f);
             bool inHeightY = (b.y + b.r >= pl.y - 82.0f && b.y - b.r <= pl.y + 8.0f);
@@ -970,6 +1473,9 @@ private:
                 b.vy = -RandRange(280.0f, 480.0f);
                 b.resting = false;
                 b.stackLevel = 0;
+                b.stackedOnId = -1;
+                b.aligning = false;
+                b.snowmanReveal = 0.0f;
             }
         }
     }
@@ -977,37 +1483,6 @@ private:
     void UpdatePlows(float dt) {
         std::vector<SnowPlow> alive;
         for (auto& pl : plows_) {
-            if (pl.blizzardMode) {
-                pl.x += pl.dir * pl.speed * dt;
-                pl.y = pl.blizzardRowY;
-                float bladeX = pl.x + pl.dir * 28.0f;
-                CarveBlizzardTunnel(bladeX, pl.y, 52.0f);
-                if (RandRange(0.0f, 1.0f) < 0.55f && flakes_.size() < 240) {
-                    Flake f;
-                    f.x = bladeX;
-                    f.y = pl.y - RandRange(6.0f, 36.0f);
-                    f.vx = pl.dir * RandRange(80.0f, 210.0f);
-                    f.vy = RandRange(-160.0f, -40.0f);
-                    f.r = RandRange(2.2f, 4.2f);
-                    f.ambient = false;
-                    f.canDeposit = false;
-                    flakes_.push_back(f);
-                }
-                if ((pl.dir == 1 && pl.x > width_ + 35) || (pl.dir == -1 && pl.x < -35)) {
-                    pl.blizzardRowY -= (BLIZZARD_STRIP_H - 6.0f);
-                    pl.dir = -pl.dir;
-                    if (pl.blizzardRowY < -BLIZZARD_STRIP_H) {
-                        blizzardActive_ = false;
-                        blizzardClearing_ = false;
-                        ClearBlizzardBitmap();
-                        continue;
-                    }
-                }
-                alive.push_back(pl);
-                continue;
-            }
-
-            // Window or independent Taskbar plow
             auto it = pl.attachedHwnd ? surfaces_.find(pl.attachedHwnd) : surfaces_.end();
             if (it != surfaces_.end()) {
                 WindowSurface& s = it->second;
@@ -1018,12 +1493,12 @@ private:
 
                 float bladeX = pl.x + pl.dir * 26.0f;
                 int bIdx = static_cast<int>((bladeX - s.rect.Left()) / BUCKET_W);
-                for (int k = bIdx - 1; k <= bIdx + 1; ++k) {
+                for (int k = bIdx - 2; k <= bIdx + 2; ++k) {
                     if (k >= 0 && k < static_cast<int>(s.heights.size()) && s.heights[k] > 0.3f) {
                         float cleared = s.heights[k];
                         s.heights[k] = 0.0f;
-                        pl.moundMass = std::min(28.0f, pl.moundMass + cleared * 0.22f);
-                        if (RandRange(0.0f, 1.0f) < 0.45f && flakes_.size() < 240) {
+                        pl.moundMass = std::min(28.0f, pl.moundMass + cleared * 0.14f);
+                        if (RandRange(0.0f, 1.0f) < 0.30f && flakes_.size() < 240) {
                             Flake f;
                             f.x = s.rect.Left() + static_cast<float>(k * BUCKET_W);
                             f.y = s.rect.Top() - RandRange(2.0f, std::max(4.0f, cleared));
@@ -1092,110 +1567,206 @@ private:
     }
 
     void UpdateSnowballs(float dt) {
-        std::vector<Snowball> survivors;
-        survivors.reserve(snowballs_.size());
+        std::vector<bool> dead(snowballs_.size(), false);
 
         for (size_t i = 0; i < snowballs_.size(); ++i) {
-            Snowball b = snowballs_[i];
-            if (b.grabbed) {
-                survivors.push_back(b);
-                continue;
-            }
+            auto& b = snowballs_[i];
+            if (b.grabbed) continue;
+            if (b.stackedOnId >= 0 && !b.collapsing) continue;
+
             b.vy += GRAVITY * dt;
             b.x += b.vx * dt;
             b.y += b.vy * dt;
             b.resting = false;
-            b.stackLevel = 0;
-            bool splat = false;
+
+            if (b.collapsing) {
+                b.collapseTimer -= dt;
+                bool hitFloor = false;
+                if (b.y + b.r >= static_cast<float>(height_)) {
+                    b.y = static_cast<float>(height_) - b.r;
+                    hitFloor = true;
+                } else if (b.vy > 0.0f) {
+                    for (HWND h : zOrder_) {
+                        auto it = surfaces_.find(h);
+                        if (it == surfaces_.end()) continue;
+                        const auto& s = it->second;
+                        if (b.x >= s.rect.Left() && b.x <= s.rect.Right()) {
+                            float sy = s.rect.Top();
+                            if (b.y + b.r >= sy - 4.0f && b.y + b.r <= sy + 24.0f) {
+                                b.y = sy - b.r;
+                                hitFloor = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (b.collapseTimer <= 0.0f || (hitFloor && b.collapseTimer < 0.22f)) {
+                    BurstIntoSnowdust(b);
+                    dead[i] = true;
+                }
+                continue;
+            }
 
             if (b.x - b.r < 0.0f || b.x + b.r > static_cast<float>(width_)) {
                 if (std::abs(b.vx) > 350.0f) {
                     SplatSnowball(b);
-                    splat = true;
+                    dead[i] = true;
+                    continue;
                 } else {
                     b.x = std::clamp(b.x, b.r, static_cast<float>(width_) - b.r);
                     b.vx *= -0.45f;
                 }
             }
 
-            if (!splat) {
-                for (HWND h : zOrder_) {
-                    auto it = surfaces_.find(h);
-                    if (it == surfaces_.end()) continue;
-                    const auto& s = it->second;
-                    if (b.x >= s.rect.Left() && b.x <= s.rect.Right()) {
-                        float sy = s.rect.Top();
-                        if (b.vy >= 0.0f && b.y + b.r >= sy - 6.0f && b.y + b.r <= sy + 24.0f) {
-                            if (std::hypot(b.vx, b.vy) > 540.0f) {
-                                SplatSnowball(b);
-                                splat = true;
-                            } else {
-                                b.y = sy - b.r;
-                                b.vy = (std::abs(b.vy) > 90.0f) ? -b.vy * 0.22f : 0.0f;
-                                b.resting = (b.vy == 0.0f);
-                                b.vx *= 0.80f;
-                            }
-                            break;
+            for (HWND h : zOrder_) {
+                auto it = surfaces_.find(h);
+                if (it == surfaces_.end()) continue;
+                const auto& s = it->second;
+                if (b.x >= s.rect.Left() && b.x <= s.rect.Right()) {
+                    float sy = s.rect.Top();
+                    if (b.vy >= 0.0f && b.y + b.r >= sy - 6.0f && b.y + b.r <= sy + 24.0f) {
+                        if (std::hypot(b.vx, b.vy) > 540.0f) {
+                            SplatSnowball(b);
+                            dead[i] = true;
+                        } else {
+                            b.y = sy - b.r;
+                            b.vy = (std::abs(b.vy) > 90.0f) ? -b.vy * 0.22f : 0.0f;
+                            b.resting = (b.vy == 0.0f);
+                            b.vx *= 0.80f;
                         }
+                        break;
                     }
                 }
             }
 
-            if (!splat && b.y + b.r > static_cast<float>(height_)) {
+            if (!dead[i] && b.y + b.r > static_cast<float>(height_)) {
                 b.y = static_cast<float>(height_) - b.r;
                 b.vy = 0.0f;
                 b.vx *= 0.80f;
                 b.resting = true;
             }
-
-            if (!splat) survivors.push_back(b);
         }
-        snowballs_.swap(survivors);
 
-        std::vector<bool> dead(snowballs_.size(), false);
+        // Smooth arc realignment for stacked snowman heads
         for (size_t i = 0; i < snowballs_.size(); ++i) {
-            if (snowballs_[i].grabbed || dead[i]) continue;
+            auto& head = snowballs_[i];
+            if (dead[i] || head.grabbed || head.collapsing || head.stackedOnId < 0) continue;
+
+            int pIdx = FindBallIndexById(head.stackedOnId);
+            if (pIdx < 0 || dead[pIdx] || snowballs_[pIdx].grabbed || snowballs_[pIdx].collapsing) {
+                head.stackedOnId = -1;
+                head.stackLevel = 0;
+                head.aligning = false;
+                head.snowmanReveal = 0.0f;
+                continue;
+            }
+
+            const auto& body = snowballs_[pIdx];
+            float nestDist = body.r + head.r - 3.0f;
+
+            if (head.aligning) {
+                head.alignAngle *= std::exp(-9.5f * dt);
+                if (std::abs(head.alignAngle) < 0.006f) {
+                    head.alignAngle = 0.0f;
+                    head.aligning = false;
+                }
+            }
+
+            head.x = body.x + std::sin(head.alignAngle) * nestDist;
+            head.y = body.y - std::cos(head.alignAngle) * nestDist;
+            head.vx = 0.0f;
+            head.vy = 0.0f;
+            head.resting = body.resting;
+            head.stackLevel = 1;
+
+            if (std::abs(head.alignAngle) < 0.25f) {
+                head.snowmanReveal = std::min(1.0f, head.snowmanReveal + dt * 4.5f);
+            }
+        }
+
+        // Snowball-to-snowball stacking (+/- 30 deg), 3rd-ball collapse, and splats
+        for (size_t i = 0; i < snowballs_.size(); ++i) {
+            if (dead[i] || snowballs_[i].grabbed || snowballs_[i].collapsing) continue;
+            if (snowballs_[i].stackedOnId >= 0) continue;
+
             for (size_t j = 0; j < snowballs_.size(); ++j) {
-                if (i == j || snowballs_[j].grabbed || dead[j]) continue;
+                if (i == j || dead[j] || snowballs_[j].grabbed || snowballs_[j].collapsing) continue;
+
                 auto& a = snowballs_[i];
                 auto& b = snowballs_[j];
+                if (b.stackedOnId == a.id) continue;
+
                 float dx = a.x - b.x;
-                float dy = a.y - b.y;
+                float dy = b.y - a.y;
                 float dist = std::hypot(dx, dy);
                 float minDist = a.r + b.r - 2.0f;
-                if (dist > 0.001f && dist < minDist) {
-                    if (std::hypot(a.vx - b.vx, a.vy - b.vy) > 350.0f) {
+
+                bool bIsSnowmanHead = (b.stackedOnId >= 0);
+                bool bIsSnowman = IsPartOfSnowman(static_cast<int>(j));
+                bool aIsSnowman = IsPartOfSnowman(static_cast<int>(i));
+
+                bool hitSnowmanHatZone = bIsSnowmanHead && (dy > 0.0f) &&
+                                         (std::abs(dx) < b.r * 1.15f) &&
+                                         (dy < a.r + b.r + 14.0f);
+
+                if ((dist > 0.001f && dist < minDist + 3.0f) || hitSnowmanHatZone) {
+                    if (bIsSnowman && !aIsSnowman) {
+                        if (dy > -b.r * 0.35f || hitSnowmanHatZone) {
+                            TriggerSnowmanCollapse(static_cast<int>(i), static_cast<int>(j));
+                            break;
+                        }
+                    }
+
+                    float relSpeed = std::hypot(a.vx - b.vx, a.vy - b.vy);
+                    if (relSpeed > 480.0f || std::abs(a.vx - b.vx) > 290.0f) {
                         SplatSnowball(a);
                         SplatSnowball(b);
                         dead[i] = dead[j] = true;
-                    } else if (a.y < b.y && std::abs(dx) < b.r * 0.75f && std::abs(a.vx) < 130.0f) {
-                        a.y = b.y - minDist;
-                        a.x += (b.x - a.x) * 0.16f;
-                        a.vy = 0.0f;
-                        a.vx *= 0.6f;
-                        a.resting = true;
-                        a.stackLevel = b.stackLevel + 1;
-                    } else {
+                        break;
+                    }
+
+                    if (!aIsSnowman && !bIsSnowman && dy > 0.0f) {
+                        float angleFromY = std::atan2(std::abs(dx), dy);
+                        if (angleFromY <= STACK_MAX_ANGLE_RAD) {
+                            a.stackedOnId = b.id;
+                            a.stackLevel = 1;
+                            a.aligning = true;
+                            a.alignAngle = std::atan2(dx, dy);
+                            a.vx = 0.0f;
+                            a.vy = 0.0f;
+                            a.resting = true;
+                            a.snowmanReveal = 0.0f;
+                            b.vx *= 0.15f;
+                            break;
+                        }
+                    }
+
+                    if (dist > 0.001f && dist < minDist) {
                         float overlap = (minDist - dist) * 0.5f;
-                        float nx = dx / dist, ny = dy / dist;
+                        float nx = dx / dist, ny = (a.y - b.y) / dist;
                         a.x += nx * overlap; a.y += ny * overlap;
-                        b.x -= nx * overlap; b.y -= ny * overlap;
+                        if (!bIsSnowman) {
+                            b.x -= nx * overlap; b.y -= ny * overlap;
+                        }
                     }
                 }
             }
         }
+
         if (std::any_of(dead.begin(), dead.end(), [](bool d) { return d; })) {
             std::vector<Snowball> kept;
+            kept.reserve(snowballs_.size());
             for (size_t i = 0; i < snowballs_.size(); ++i) {
                 if (!dead[i]) kept.push_back(snowballs_[i]);
             }
             snowballs_.swap(kept);
-            draggedIdx_ = -1;
+            if (FindBallIndexById(draggedBallId_) < 0) draggedBallId_ = -1;
         }
     }
 
     void UpdateSanta(float dt) {
         if (!santa_.active) {
+            if (!snowfallActive_) return;
             santaCooldown_ -= dt;
             if (santaCooldown_ <= 0.0f) {
                 SummonSanta();
@@ -1234,6 +1805,50 @@ private:
     }
 
     // --- Rendering ---
+    void DrawPenguin(Graphics& g, const Penguin& pg) {
+        GraphicsState st = g.Save();
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.TranslateTransform(pg.x, pg.y + pg.hopY);
+        g.ScaleTransform(pg.dir * pg.scale, pg.scale);
+
+        float waddleSin = std::sin(pg.waddlePhase);
+        float bounce = std::abs(waddleSin) * 1.8f;
+        float tiltDeg = waddleSin * 7.0f;
+
+        g.TranslateTransform(0.0f, -bounce);
+        g.RotateTransform(tiltDeg);
+
+        SolidBrush orange(Color(255, 245, 146, 26));
+        SolidBrush darkFeather(Color(255, 28, 32, 42));
+        SolidBrush flipperColor(Color(255, 20, 24, 33));
+        SolidBrush bellyWhite(Color(255, 248, 251, 255));
+        SolidBrush pupil(Color(255, 15, 18, 24));
+
+        float step = waddleSin * 3.0f;
+        g.FillEllipse(&orange, -5.5f - step, -3.2f, 6.8f, 3.2f);
+        g.FillEllipse(&orange, -0.5f + step, -3.2f, 6.8f, 3.2f);
+
+        g.FillEllipse(&darkFeather, -8.2f, -21.5f, 16.4f, 19.8f);
+        g.FillEllipse(&bellyWhite, -3.0f, -16.8f, 10.2f, 14.0f);
+
+        g.FillEllipse(&darkFeather, -6.5f, -29.2f, 13.0f, 11.8f);
+        g.FillEllipse(&bellyWhite, 0.2f, -25.2f, 5.2f, 5.2f);
+
+        g.FillEllipse(&bellyWhite, 1.4f, -26.2f, 3.6f, 3.6f);
+        g.FillEllipse(&pupil, 2.6f, -25.4f, 2.0f, 2.0f);
+
+        PointF beak[3] = { {5.4f, -24.2f}, {11.6f, -22.2f}, {5.4f, -20.5f} };
+        g.FillPolygon(&orange, beak, 3);
+
+        GraphicsState wingSt = g.Save();
+        g.TranslateTransform(-1.5f, -16.0f);
+        g.RotateTransform(14.0f + waddleSin * 12.0f);
+        g.FillEllipse(&flipperColor, -3.0f, 0.0f, 5.2f, 11.0f);
+        g.Restore(wingSt);
+
+        g.Restore(st);
+    }
+
     void DrawRedPlow(Graphics& g, const SnowPlow& pl) {
         GraphicsState st = g.Save();
         g.SetSmoothingMode(SmoothingModeAntiAlias);
@@ -1316,6 +1931,91 @@ private:
         g.Restore(st);
     }
 
+    void DrawSnowmanStickArms(Graphics& g, const Snowball& body, BYTE alpha) {
+        Pen mainStick(Color(alpha, 104, 62, 34), 2.6f);
+        mainStick.SetStartCap(LineCapRound);
+        mainStick.SetEndCap(LineCapRound);
+        Pen twigPen(Color(alpha, 104, 62, 34), 1.7f);
+        twigPen.SetEndCap(LineCapRound);
+
+        float lx0 = body.x - body.r * 0.78f;
+        float ly0 = body.y - body.r * 0.12f;
+        float lx1 = body.x - body.r * 1.95f;
+        float ly1 = body.y - body.r * 0.78f;
+        g.DrawLine(&mainStick, lx0, ly0, lx1, ly1);
+        float lmx = lx0 + (lx1 - lx0) * 0.72f;
+        float lmy = ly0 + (ly1 - ly0) * 0.72f;
+        g.DrawLine(&twigPen, lmx, lmy, lmx - body.r * 0.32f, lmy - body.r * 0.36f);
+        g.DrawLine(&twigPen, lmx, lmy, lmx - body.r * 0.36f, lmy + body.r * 0.14f);
+
+        float rx0 = body.x + body.r * 0.78f;
+        float ry0 = body.y - body.r * 0.12f;
+        float rx1 = body.x + body.r * 1.95f;
+        float ry1 = body.y - body.r * 0.78f;
+        g.DrawLine(&mainStick, rx0, ry0, rx1, ry1);
+        float rmx = rx0 + (rx1 - rx0) * 0.72f;
+        float rmy = ry0 + (ry1 - ry0) * 0.72f;
+        g.DrawLine(&twigPen, rmx, rmy, rmx + body.r * 0.32f, rmy - body.r * 0.36f);
+        g.DrawLine(&twigPen, rmx, rmy, rmx + body.r * 0.36f, rmy + body.r * 0.14f);
+    }
+
+    void DrawSnowmanAccessories(Graphics& g, const Snowball& head, const Snowball& body, BYTE alpha) {
+        float neckY = head.y + head.r - 1.5f;
+        float neckW = std::min(head.r, body.r) * 1.85f;
+        SolidBrush scarfRed(Color(alpha, 215, 28, 38));
+        SolidBrush scarfStripe(Color(alpha, 245, 215, 110));
+        Pen scarfOutline(Color(alpha, 155, 18, 26), 1.0f);
+
+        PointF tail[4] = {
+            { head.x + neckW * 0.18f, neckY + 1.0f },
+            { head.x + neckW * 0.44f, neckY + 1.0f },
+            { head.x + neckW * 0.56f, neckY + body.r * 0.92f },
+            { head.x + neckW * 0.24f, neckY + body.r * 0.86f }
+        };
+        g.FillPolygon(&scarfRed, tail, 4);
+        g.DrawPolygon(&scarfOutline, tail, 4);
+
+        RectF wrapRect(head.x - neckW * 0.5f, neckY - 3.0f, neckW, 6.2f);
+        g.FillRectangle(&scarfRed, wrapRect);
+        g.FillRectangle(&scarfStripe, head.x - neckW * 0.5f + 2.0f, neckY - 0.5f, neckW - 4.0f, 1.4f);
+        g.DrawRectangle(&scarfOutline, wrapRect);
+
+        SolidBrush coal(Color(alpha, 26, 28, 34));
+        float eyeR = std::max(1.9f, head.r * 0.14f);
+        g.FillEllipse(&coal, head.x - head.r * 0.32f - eyeR, head.y - head.r * 0.26f - eyeR, eyeR * 2.0f, eyeR * 2.0f);
+        g.FillEllipse(&coal, head.x + head.r * 0.32f - eyeR, head.y - head.r * 0.26f - eyeR, eyeR * 2.0f, eyeR * 2.0f);
+
+        float dotR = std::max(1.2f, head.r * 0.085f);
+        for (int k = 0; k < 5; ++k) {
+            float t = static_cast<float>(k) / 4.0f;
+            float ang = (28.0f + t * 124.0f) * PI_F / 180.0f;
+            float sx = head.x - std::cos(ang) * (head.r * 0.46f);
+            float sy = head.y + head.r * 0.10f + std::sin(ang) * (head.r * 0.42f);
+            g.FillEllipse(&coal, sx - dotR, sy - dotR, dotR * 2.0f, dotR * 2.0f);
+        }
+
+        SolidBrush carrot(Color(alpha, 248, 122, 24));
+        Pen carrotRim(Color(alpha, 195, 78, 12), 0.9f);
+        PointF nose[3] = {
+            { head.x, head.y - 2.0f },
+            { head.x + head.r * 0.95f, head.y + 1.5f },
+            { head.x, head.y + 3.2f }
+        };
+        g.FillPolygon(&carrot, nose, 3);
+        g.DrawPolygon(&carrotRim, nose, 3);
+
+        float brimW = head.r * 1.75f;
+        float brimH = 4.0f;
+        float crownW = head.r * 1.08f;
+        float crownH = std::max(10.0f, head.r * 0.85f);
+        float brimY = head.y - head.r - 2.2f;
+
+        SolidBrush hatBlack(Color(alpha, 28, 30, 38));
+        g.FillRectangle(&hatBlack, head.x - crownW * 0.5f, brimY - crownH, crownW, crownH + 1.0f);
+        g.FillRectangle(&scarfRed, head.x - crownW * 0.5f, brimY - 3.2f, crownW, 3.0f);
+        g.FillRectangle(&hatBlack, head.x - brimW * 0.5f, brimY, brimW, brimH);
+    }
+
     void RenderFrame() {
         if (!dibBits_ || !memDC_) return;
         ZeroMemory(dibBits_, static_cast<size_t>(width_) * height_ * 4);
@@ -1323,13 +2023,8 @@ private:
         Graphics g(memDC_);
         g.SetCompositingMode(CompositingModeSourceOver);
 
-        // 1. Full-screen idle blizzard blanket
-        if (blizzardActive_ && blizBmp_) {
-            g.SetInterpolationMode(InterpolationModeLowQuality);
-            g.DrawImage(blizBmp_.get(), 0, 0, width_, height_);
-        }
-
-        // 2. Window & taskbar snowbanks
+        // 1. Window & taskbar snowbanks (curved to hug Windows 11 rounded corners)
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
         SolidBrush snowBr(Color(244, 246, 251, 255));
         for (auto it = zOrder_.rbegin(); it != zOrder_.rend(); ++it) {
             auto sit = surfaces_.find(*it);
@@ -1340,49 +2035,88 @@ private:
             size_t n = s.heights.size();
             size_t i = 0;
             while (i < n) {
-                if (s.heights[i] > 0.5f) {
+                if (s.heights[i] > 0.35f) {
+                    size_t iStart = i;
                     polyBuf_.clear();
-                    polyBuf_.push_back({ x0 + static_cast<float>(i * BUCKET_W), yBase });
-                    while (i < n && s.heights[i] > 0.5f) {
-                        polyBuf_.push_back({ x0 + (static_cast<float>(i) + 0.5f) * BUCKET_W, yBase - s.heights[i] });
+                    float startLX = static_cast<float>(iStart * BUCKET_W);
+                    polyBuf_.push_back({ x0 + startLX, yBase + CornerDropAt(s, startLX) });
+
+                    while (i < n && s.heights[i] > 0.35f) {
+                        float midLX = (static_cast<float>(i) + 0.5f) * BUCKET_W;
+                        polyBuf_.push_back({ x0 + midLX, yBase + CornerDropAt(s, midLX) - s.heights[i] });
                         ++i;
                     }
-                    polyBuf_.push_back({ x0 + static_cast<float>(i * BUCKET_W), yBase });
+
+                    size_t iEnd = i;
+                    float endLX = std::min(s.rect.w, static_cast<float>(iEnd * BUCKET_W));
+                    polyBuf_.push_back({ x0 + endLX, yBase + CornerDropAt(s, endLX) });
+
+                    if (!s.isTaskbar) {
+                        for (size_t k = iEnd; k > iStart; --k) {
+                            float lx = (static_cast<float>(k - 1) + 0.5f) * BUCKET_W;
+                            if (lx < cornerRadius_ + BUCKET_W || (s.rect.w - lx) < cornerRadius_ + BUCKET_W) {
+                                polyBuf_.push_back({ x0 + lx, yBase + CornerDropAt(s, lx) });
+                            }
+                        }
+                    }
+
                     g.FillPolygon(&snowBr, polyBuf_.data(), static_cast<INT>(polyBuf_.size()));
                 } else {
                     ++i;
                 }
             }
         }
+        g.SetSmoothingMode(SmoothingModeNone);
+
+        // 2. Strolling taskbar penguins
+        for (const auto& pg : penguins_) DrawPenguin(g, pg);
 
         // 3. Red snowplows
         for (const auto& pl : plows_) DrawRedPlow(g, pl);
 
-        // 4. Snowballs & stacked snowmen
+        // 4. Snowballs & complete 2-ball snowmen
         if (!snowballs_.empty()) {
             g.SetSmoothingMode(SmoothingModeAntiAlias);
             Pen ballRim(Color(225, 180, 212, 238), 1.4f);
             SolidBrush ballFill(Color(250, 249, 253, 255));
-            SolidBrush coal(Color(255, 32, 34, 42));
-            SolidBrush carrot(Color(255, 245, 118, 28));
+
             for (const auto& b : snowballs_) {
-                g.FillEllipse(&ballFill, b.x - b.r, b.y - b.r, b.r * 2.0f, b.r * 2.0f);
-                g.DrawEllipse(&ballRim, b.x - b.r, b.y - b.r, b.r * 2.0f, b.r * 2.0f);
-                if (b.stackLevel >= 1 && b.resting) {
-                    g.FillEllipse(&coal, b.x - b.r * 0.3f - 2.2f, b.y - b.r * 0.2f - 2.2f, 4.4f, 4.4f);
-                    g.FillEllipse(&coal, b.x + b.r * 0.3f - 2.2f, b.y - b.r * 0.2f - 2.2f, 4.4f, 4.4f);
-                    PointF nose[3] = { {b.x, b.y - 1.0f}, {b.x + b.r * 0.7f, b.y + 1.5f}, {b.x, b.y + 3.5f} };
-                    g.FillPolygon(&carrot, nose, 3);
-                    if (b.stackLevel >= 2) {
-                        g.FillRectangle(&coal, b.x - b.r * 0.75f, b.y - b.r - 2.0f, b.r * 1.5f, 3.5f);
-                        g.FillRectangle(&coal, b.x - b.r * 0.45f, b.y - b.r - 13.0f, b.r * 0.9f, 11.0f);
-                    }
+                if (b.collapsing || b.stackedOnId >= 0) continue;
+                int childIdx = FindStackedChildIndex(b.id);
+                if (childIdx >= 0 && snowballs_[childIdx].snowmanReveal > 0.02f) {
+                    BYTE alpha = static_cast<BYTE>(255.0f * snowballs_[childIdx].snowmanReveal);
+                    DrawSnowmanStickArms(g, b, alpha);
                 }
             }
+
+            for (int pass = 0; pass < 2; ++pass) {
+                for (const auto& b : snowballs_) {
+                    bool isHead = (b.stackedOnId >= 0);
+                    if ((pass == 0 && isHead) || (pass == 1 && !isHead)) continue;
+                    g.FillEllipse(&ballFill, b.x - b.r, b.y - b.r, b.r * 2.0f, b.r * 2.0f);
+                    g.DrawEllipse(&ballRim, b.x - b.r, b.y - b.r, b.r * 2.0f, b.r * 2.0f);
+                }
+            }
+
+            for (const auto& head : snowballs_) {
+                if (head.collapsing || head.stackedOnId < 0 || head.snowmanReveal <= 0.02f) continue;
+                int bodyIdx = FindBallIndexById(head.stackedOnId);
+                if (bodyIdx < 0) continue;
+                BYTE alpha = static_cast<BYTE>(255.0f * head.snowmanReveal);
+                DrawSnowmanAccessories(g, head, snowballs_[bodyIdx], alpha);
+            }
+
             g.SetSmoothingMode(SmoothingModeNone);
         }
 
-        // 5. Clip snowfall & Santa out of actively focused windowed apps
+        // 5. Snowdust particles
+        for (const auto& d : dust_) {
+            BYTE alpha = static_cast<BYTE>(235.0f * std::max(0.0f, d.life / d.maxLife));
+            SolidBrush dbr(d.icyTint ? Color(alpha, 208, 232, 252) : Color(alpha, 252, 254, 255));
+            g.FillEllipse(&dbr, d.x - d.r, d.y - d.r, d.r * 2.0f, d.r * 2.0f);
+        }
+
+        // 6. Clip snowfall & Santa out of actively focused windowed apps
         if (hasActiveWindowClip_) {
             RectF excl(activeWindowClip_.x, activeWindowClip_.y, activeWindowClip_.w, activeWindowClip_.h);
             g.SetClip(excl, CombineModeExclude);
@@ -1419,11 +2153,24 @@ private:
 
         for (int i = static_cast<int>(snowballs_.size()) - 1; i >= 0; --i) {
             auto& b = snowballs_[i];
+            if (b.collapsing) continue;
             if (std::hypot(mx - b.x, my - b.y) <= b.r + 7.0f) {
                 b.grabbed = true;
                 b.resting = false;
                 b.stackLevel = 0;
-                draggedIdx_ = i;
+                b.stackedOnId = -1;
+                b.aligning = false;
+                b.snowmanReveal = 0.0f;
+                int childIdx = FindStackedChildIndex(b.id);
+                if (childIdx >= 0) {
+                    auto& c = snowballs_[childIdx];
+                    c.stackedOnId = -1;
+                    c.stackLevel = 0;
+                    c.aligning = false;
+                    c.snowmanReveal = 0.0f;
+                    c.resting = false;
+                }
+                draggedBallId_ = b.id;
                 SetCapture(hwnd_);
                 return;
             }
@@ -1435,17 +2182,18 @@ private:
                 int idx = static_cast<int>((mx - s.rect.Left()) / BUCKET_W);
                 if (idx >= 0 && idx < static_cast<int>(s.heights.size()) && s.heights[idx] >= 4.0f) {
                     float scooped = 0.0f;
-                    for (int k = std::max(0, idx - 3); k <= std::min(static_cast<int>(s.heights.size()) - 1, idx + 3); ++k) {
+                    for (int k = std::max(0, idx - 5); k <= std::min(static_cast<int>(s.heights.size()) - 1, idx + 5); ++k) {
                         float take = std::min(s.heights[k], 12.0f);
                         s.heights[k] -= take;
                         scooped += take;
                     }
                     Snowball b;
+                    b.id = nextBallId_++;
                     b.x = mx; b.y = my;
-                    b.r = std::clamp(10.0f + scooped * 0.16f, 11.0f, 22.0f);
+                    b.r = std::clamp(10.0f + scooped * 0.11f, 11.0f, 22.0f);
                     b.grabbed = true;
                     snowballs_.push_back(b);
-                    draggedIdx_ = static_cast<int>(snowballs_.size()) - 1;
+                    draggedBallId_ = b.id;
                     SetCapture(hwnd_);
                     return;
                 }
@@ -1454,42 +2202,64 @@ private:
 
         if (GetAsyncKeyState(VK_SHIFT) & 0x8000) {
             Snowball b;
-            b.x = mx; b.y = my; b.r = 14.0f; b.grabbed = true;
+            b.id = nextBallId_++;
+            b.x = mx; b.y = my; b.r = 15.0f; b.grabbed = true;
             snowballs_.push_back(b);
-            draggedIdx_ = static_cast<int>(snowballs_.size()) - 1;
+            draggedBallId_ = b.id;
             SetCapture(hwnd_);
         }
     }
 
     void OnMouseMove(int x, int y) {
-        if (draggedIdx_ < 0 || draggedIdx_ >= static_cast<int>(snowballs_.size())) return;
+        int idx = FindBallIndexById(draggedBallId_);
+        if (idx < 0) return;
         float dx = static_cast<float>(x - lastMouse_.x);
         float dy = static_cast<float>(y - lastMouse_.y);
         mouseVx_ = mouseVx_ * 0.45f + dx * 28.0f;
         mouseVy_ = mouseVy_ * 0.45f + dy * 28.0f;
-        snowballs_[draggedIdx_].x = static_cast<float>(x);
-        snowballs_[draggedIdx_].y = static_cast<float>(y);
+        snowballs_[idx].x = static_cast<float>(x);
+        snowballs_[idx].y = static_cast<float>(y);
         lastMouse_ = { x, y };
     }
 
     void OnLButtonUp() {
-        if (draggedIdx_ >= 0 && draggedIdx_ < static_cast<int>(snowballs_.size())) {
-            auto& b = snowballs_[draggedIdx_];
+        int idx = FindBallIndexById(draggedBallId_);
+        if (idx >= 0) {
+            auto& b = snowballs_[idx];
             b.grabbed = false;
             b.vx = std::clamp(mouseVx_, -1050.0f, 1050.0f);
             b.vy = std::clamp(mouseVy_, -1050.0f, 1050.0f);
         }
-        draggedIdx_ = -1;
+        draggedBallId_ = -1;
         ReleaseCapture();
     }
 
     void ShowTrayMenu() {
         bool autoStart = IsAutoStartEnabled();
+        bool isPreset = (idleDelaySec_ == 0 || idleDelaySec_ == 30 || idleDelaySec_ == 60 ||
+                         idleDelaySec_ == 120 || idleDelaySec_ == 300 || idleDelaySec_ == 600);
+
+        HMENU idleSub = CreatePopupMenu();
+        AppendMenuW(idleSub, MF_STRING | (idleDelaySec_ == 0 ? MF_CHECKED : 0), ID_IDLE_0, L"Immediate (0s)");
+        AppendMenuW(idleSub, MF_STRING | (idleDelaySec_ == 30 ? MF_CHECKED : 0), ID_IDLE_30, L"30 Seconds");
+        AppendMenuW(idleSub, MF_STRING | (idleDelaySec_ == 60 ? MF_CHECKED : 0), ID_IDLE_60, L"1 Minute");
+        AppendMenuW(idleSub, MF_STRING | (idleDelaySec_ == 120 ? MF_CHECKED : 0), ID_IDLE_120, L"2 Minutes (Default)");
+        AppendMenuW(idleSub, MF_STRING | (idleDelaySec_ == 300 ? MF_CHECKED : 0), ID_IDLE_300, L"5 Minutes");
+        AppendMenuW(idleSub, MF_STRING | (idleDelaySec_ == 600 ? MF_CHECKED : 0), ID_IDLE_600, L"10 Minutes");
+        AppendMenuW(idleSub, MF_SEPARATOR, 0, nullptr);
+        std::wstring customLabel = isPreset
+            ? L"Custom..."
+            : (L"Custom (" + FormatIdleDuration(idleDelaySec_) + L")...");
+        AppendMenuW(idleSub, MF_STRING | (!isPreset ? MF_CHECKED : 0), ID_IDLE_CUSTOM, customLabel.c_str());
 
         HMENU menu = CreatePopupMenu();
+        std::wstring idleTitle = L"Idle Timer (" + FormatIdleDuration(idleDelaySec_) + L")";
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(idleSub), idleTitle.c_str());
+        AppendMenuW(menu, MF_STRING | (forceSnowfall_ ? MF_CHECKED : 0), ID_TRAY_FORCE_SNOW, L"Force Snowfall (Skip Idle)");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, ID_TRAY_PLOW_WIN, L"Plow Top Window");
         AppendMenuW(menu, MF_STRING, ID_TRAY_PLOW_TB, L"Plow Taskbar Now");
-        AppendMenuW(menu, MF_STRING, ID_TRAY_BLIZZARD, L"Test Blizzard + Clear");
+        AppendMenuW(menu, MF_STRING, ID_TRAY_PENGUINS, L"Summon Penguins");
         AppendMenuW(menu, MF_STRING, ID_TRAY_SANTA, L"Summon Santa Sleigh");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING | (ecoMode_ ? MF_CHECKED : 0), ID_TRAY_ECO, L"Eco Mode (20 FPS)");
@@ -1503,24 +2273,27 @@ private:
         SetForegroundWindow(hwnd_);
         UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd_, nullptr);
         PostMessageW(hwnd_, WM_NULL, 0, 0);
-        DestroyMenu(menu);
+        DestroyMenu(menu); // Also destroys idleSub
 
         switch (cmd) {
+        case ID_IDLE_0: ApplyIdleDelay(0); break;
+        case ID_IDLE_30: ApplyIdleDelay(30); break;
+        case ID_IDLE_60: ApplyIdleDelay(60); break;
+        case ID_IDLE_120: ApplyIdleDelay(120); break;
+        case ID_IDLE_300: ApplyIdleDelay(300); break;
+        case ID_IDLE_600: ApplyIdleDelay(600); break;
+        case ID_IDLE_CUSTOM: ShowCustomIdleDialog(); break;
+        case ID_TRAY_FORCE_SNOW:
+            forceSnowfall_ = !forceSnowfall_;
+            RefreshSnowfallActive(GetGlobalIdleSeconds());
+            break;
         case ID_TRAY_PLOW_WIN: SummonTopWindowPlow(); break;
         case ID_TRAY_PLOW_TB: SummonTaskbarPlow(); break;
-        case ID_TRAY_BLIZZARD:
-            SetPaused(false);
-            blizzardActive_ = true;
-            blizzardClearing_ = false;
-            blizzardFillY_ = 0.0f;
-            PaintFullBlizzard();
-            StartBlizzardClear();
-            break;
+        case ID_TRAY_PENGUINS: SummonPenguinGroup(); break;
         case ID_TRAY_SANTA: SummonSanta(); break;
         case ID_TRAY_ECO:
             ecoMode_ = !ecoMode_;
             if (!paused_) SetTimer(hwnd_, TIMER_TICK, TargetFrameMs(), nullptr);
-            SeedAmbientFlakes();
             break;
         case ID_TRAY_AUTOSTART:
             SetAutoStart(!autoStart);
