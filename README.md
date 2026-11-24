@@ -4,12 +4,6 @@ A lightweight, native Windows winter desktop overlay written in C++20. After you
 
 Built directly on the Win32 API and GDI+ with zero runtime dependencies—just a single standalone `.exe` using roughly **10–18 MB of RAM**.
 
-<!-- If you added a demo GIF, keep your image/video embed right here:
-<p align="center">
-  <img src="assets/demo.gif" alt="Winter Desktop Demo" width="850">
-</p>
--->
-
 ## Features
 
 * **Configurable Idle Timer:** Snowfall and ambient events stay quiet while you work and begin automatically once your system has been idle (defaults to **2 minutes**). Pick from quick tray presets (`Immediate`, `30s`, `1m`, `2m`, `5m`, `10m`) or set any **Custom** duration in minutes & seconds—automatically saved across reboots.
@@ -23,7 +17,7 @@ Built directly on the Win32 API and GDI+ with zero runtime dependencies—just a
 
 ## Download & Install (No Coding Required)
 
-1. Go to the **[Releases](https://github.com/<your-username>/winter-desktop/releases)** page.
+1. Go to the **[Releases](https://github.com/probalkar/winter-desktop/releases)** page.
 2. Download **`WinterDesktop.exe`** from the latest release.
 3. Move `WinterDesktop.exe` to a permanent folder (for example, `C:\Apps\WinterDesktop\`) and double-click it to run.
 4. *(Optional)* Right-click the **snowflake icon** in your Windows system tray (bottom-right) to customize your **Idle Timer** or enable **Start with Windows**.
