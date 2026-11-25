@@ -66,6 +66,11 @@ constexpr UINT ID_IDLE_300 = 1104;
 constexpr UINT ID_IDLE_600 = 1105;
 constexpr UINT ID_IDLE_CUSTOM = 1106;
 
+// Blizzard Intensity Submenu IDs
+constexpr UINT ID_INTENSITY_LIGHT = 1200;
+constexpr UINT ID_INTENSITY_MODERATE = 1201;
+constexpr UINT ID_INTENSITY_SEVERE = 1202;
+
 // Custom Idle Dialog Control IDs
 constexpr int IDC_EDIT_MIN = 2001;
 constexpr int IDC_EDIT_SEC = 2002;
@@ -74,8 +79,24 @@ constexpr const wchar_t* REG_RUN_PATH = L"Software\\Microsoft\\Windows\\CurrentV
 constexpr const wchar_t* REG_APP_NAME = L"WinterDesktop";
 constexpr const wchar_t* REG_SETTINGS_PATH = L"Software\\WinterDesktop";
 constexpr const wchar_t* REG_IDLE_VALUE = L"IdleDelaySec";
+constexpr const wchar_t* REG_INTENSITY_VALUE = L"BlizzardIntensity";
 
 const HWND TASKBAR_KEY = reinterpret_cast<HWND>(static_cast<intptr_t>(-999));
+
+enum class BlizzardIntensity : DWORD {
+    Light = 0,
+    Moderate = 1,
+    Severe = 2
+};
+
+const wchar_t* IntensityLabel(BlizzardIntensity lvl) {
+    switch (lvl) {
+    case BlizzardIntensity::Moderate: return L"Moderate";
+    case BlizzardIntensity::Severe:   return L"Severe";
+    case BlizzardIntensity::Light:
+    default:                          return L"Light";
+    }
+}
 
 // --- Fast RNG ---
 std::mt19937& Rng() {
@@ -210,32 +231,48 @@ bool SetAutoStart(bool enable) {
     return status == ERROR_SUCCESS;
 }
 
-DWORD LoadIdleDelaySeconds() {
+DWORD LoadRegDwordSetting(const wchar_t* valueName, DWORD defaultVal, DWORD maxVal) {
     HKEY hKey = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_SETTINGS_PATH, 0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS) {
-        return DEFAULT_IDLE_SEC;
+        return defaultVal;
     }
-    DWORD val = DEFAULT_IDLE_SEC;
+    DWORD val = defaultVal;
     DWORD type = 0;
     DWORD size = sizeof(val);
-    if (RegQueryValueExW(hKey, REG_IDLE_VALUE, nullptr, &type, reinterpret_cast<LPBYTE>(&val), &size) != ERROR_SUCCESS ||
+    if (RegQueryValueExW(hKey, valueName, nullptr, &type, reinterpret_cast<LPBYTE>(&val), &size) != ERROR_SUCCESS ||
         type != REG_DWORD) {
-        val = DEFAULT_IDLE_SEC;
+        val = defaultVal;
     }
     RegCloseKey(hKey);
-    return std::min(val, MAX_IDLE_SEC);
+    return std::min(val, maxVal);
 }
 
-void SaveIdleDelaySeconds(DWORD seconds) {
-    DWORD clamped = std::min(seconds, MAX_IDLE_SEC);
+void SaveRegDwordSetting(const wchar_t* valueName, DWORD value) {
     HKEY hKey = nullptr;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_SETTINGS_PATH, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
-        RegSetValueExW(hKey, REG_IDLE_VALUE, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&clamped), sizeof(clamped));
+        RegSetValueExW(hKey, valueName, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
         RegCloseKey(hKey);
     }
 }
 
-// --- Native Custom Idle Timer Dialog (Zero Resource File Needed) ---
+DWORD LoadIdleDelaySeconds() {
+    return LoadRegDwordSetting(REG_IDLE_VALUE, DEFAULT_IDLE_SEC, MAX_IDLE_SEC);
+}
+
+void SaveIdleDelaySeconds(DWORD seconds) {
+    SaveRegDwordSetting(REG_IDLE_VALUE, std::min(seconds, MAX_IDLE_SEC));
+}
+
+BlizzardIntensity LoadBlizzardIntensity() {
+    DWORD raw = LoadRegDwordSetting(REG_INTENSITY_VALUE, 0, 2);
+    return static_cast<BlizzardIntensity>(raw);
+}
+
+void SaveBlizzardIntensity(BlizzardIntensity lvl) {
+    SaveRegDwordSetting(REG_INTENSITY_VALUE, static_cast<DWORD>(lvl));
+}
+
+// --- Native Custom Idle Timer Dialog ---
 struct IdleDialogState {
     bool done = false;
     bool accepted = false;
@@ -343,6 +380,8 @@ struct Snowball {
     float x = 0, y = 0, vx = 0, vy = 0, r = 15.0f;
     bool grabbed = false;
     bool resting = false;
+    HWND restingHwnd = nullptr;  // Last surface this snowball rested on
+    bool fellFromWindow = false; // True when detached from an app window -> collapses on taskbar impact
     int stackLevel = 0;          // 0 = standalone / snowman body, 1 = snowman head
     int stackedOnId = -1;        // ID of lower body snowball when stacked
     bool aligning = false;
@@ -375,6 +414,7 @@ public:
         hInst_ = hInst;
         ownPid_ = GetCurrentProcessId();
         idleDelaySec_ = LoadIdleDelaySeconds();
+        intensity_ = LoadBlizzardIntensity();
         SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
 
         WNDCLASSEXW wc{};
@@ -456,7 +496,8 @@ private:
     bool paused_ = false;
     bool ecoMode_ = false;
     DWORD idleDelaySec_ = DEFAULT_IDLE_SEC;
-    bool forceSnowfall_ = false;  // Temporary override toggle
+    BlizzardIntensity intensity_ = BlizzardIntensity::Light;
+    bool forceSnowfall_ = false;
     bool snowfallActive_ = false;
     bool lastFrameHadContent_ = false;
     bool hasActiveWindowClip_ = false;
@@ -489,7 +530,33 @@ private:
     std::vector<PointF> polyBuf_;
 
     UINT TargetFrameMs() const { return ecoMode_ ? 50 : 33; } // 20 FPS eco / 30 FPS normal
-    size_t TargetAmbientCount() const { return ecoMode_ ? 36 : 58; }
+
+    size_t TargetAmbientCount() const {
+        switch (intensity_) {
+        case BlizzardIntensity::Moderate: return ecoMode_ ? 68 : 115;
+        case BlizzardIntensity::Severe:   return ecoMode_ ? 110 : 195;
+        case BlizzardIntensity::Light:
+        default:                          return ecoMode_ ? 36 : 58;
+        }
+    }
+
+    float AmbientSpawnRate() const {
+        switch (intensity_) {
+        case BlizzardIntensity::Moderate: return 34.0f;
+        case BlizzardIntensity::Severe:   return 70.0f;
+        case BlizzardIntensity::Light:
+        default:                          return 14.0f;
+        }
+    }
+
+    size_t MaxFlakeCount() const {
+        switch (intensity_) {
+        case BlizzardIntensity::Moderate: return 340;
+        case BlizzardIntensity::Severe:   return 460;
+        case BlizzardIntensity::Light:
+        default:                          return 240;
+        }
+    }
 
     void RefreshSnowfallActive(float globalIdle) {
         snowfallActive_ = forceSnowfall_ || (idleDelaySec_ == 0) ||
@@ -500,6 +567,38 @@ private:
         idleDelaySec_ = std::min(newSeconds, MAX_IDLE_SEC);
         SaveIdleDelaySeconds(idleDelaySec_);
         RefreshSnowfallActive(GetGlobalIdleSeconds());
+    }
+
+    void ApplyBlizzardIntensity(BlizzardIntensity newLvl) {
+        intensity_ = newLvl;
+        SaveBlizzardIntensity(intensity_);
+
+        // Immediately adapt existing ambient flakes to the new weather intensity
+        size_t target = TargetAmbientCount();
+        size_t keptAmbient = 0;
+        std::vector<Flake> adjusted;
+        adjusted.reserve(flakes_.size());
+        for (auto f : flakes_) {
+            if (f.ambient) {
+                if (keptAmbient >= target) continue;
+                ++keptAmbient;
+                if (intensity_ == BlizzardIntensity::Light) {
+                    f.vx = std::clamp(f.vx, -24.0f, 24.0f);
+                    f.vy = std::clamp(f.vy, 45.0f, 95.0f);
+                    f.depositAmt = 2.0f;
+                } else if (intensity_ == BlizzardIntensity::Moderate) {
+                    f.vx = RandRange(40.0f, 95.0f);
+                    f.vy = RandRange(75.0f, 145.0f);
+                    f.depositAmt = 2.6f;
+                } else {
+                    f.vx = RandRange(130.0f, 240.0f);
+                    f.vy = RandRange(120.0f, 210.0f);
+                    f.depositAmt = 3.4f;
+                }
+            }
+            adjusted.push_back(f);
+        }
+        flakes_.swap(adjusted);
     }
 
     void ShowCustomIdleDialog() {
@@ -618,7 +717,7 @@ private:
         BITMAPINFO bmi{};
         bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bmi.bmiHeader.biWidth = width_;
-        bmi.bmiHeader.biHeight = -height_; // top-down DIB
+        bmi.bmiHeader.biHeight = -height_;
         bmi.bmiHeader.biPlanes = 1;
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = BI_RGB;
@@ -732,7 +831,7 @@ private:
         }
     }
 
-    // --- Snowball Lookup Helpers ---
+    // --- Snowball Lookup & Fall Tracking Helpers ---
     int FindBallIndexById(int id) const {
         if (id < 0) return -1;
         for (size_t i = 0; i < snowballs_.size(); ++i) {
@@ -758,16 +857,62 @@ private:
         return (b.stackedOnId >= 0) || (FindStackedChildIndex(b.id) >= 0);
     }
 
+    void MarkBallsOnWindowAsFalling(HWND windowHwnd) {
+        if (!windowHwnd || windowHwnd == TASKBAR_KEY) return;
+        for (auto& b : snowballs_) {
+            if (b.grabbed || b.collapsing) continue;
+            if (b.restingHwnd == windowHwnd) {
+                b.fellFromWindow = true;
+                b.restingHwnd = nullptr;
+                b.resting = false;
+                int childIdx = FindStackedChildIndex(b.id);
+                if (childIdx >= 0) {
+                    snowballs_[childIdx].fellFromWindow = true;
+                }
+            }
+        }
+    }
+
     Flake MakeAmbientFlake(bool randomY) {
         Flake f;
-        f.x = RandRange(0.0f, static_cast<float>(width_));
-        f.y = randomY ? RandRange(0.0f, static_cast<float>(height_)) : RandRange(-20.0f, -2.0f);
-        f.vx = RandRange(-18.0f, 18.0f);
-        f.vy = RandRange(45.0f, 95.0f);
-        f.r = RandRange(1.7f, 3.6f);
         f.ambient = true;
         f.canDeposit = true;
-        f.depositAmt = 2.0f;
+
+        if (intensity_ == BlizzardIntensity::Light) {
+            f.x = RandRange(0.0f, static_cast<float>(width_));
+            f.y = randomY ? RandRange(0.0f, static_cast<float>(height_)) : RandRange(-20.0f, -2.0f);
+            f.vx = RandRange(-18.0f, 18.0f);
+            f.vy = RandRange(45.0f, 95.0f);
+            f.r = RandRange(1.7f, 3.6f);
+            f.depositAmt = 2.0f;
+        } else if (intensity_ == BlizzardIntensity::Moderate) {
+            bool spawnLeft = !randomY && (RandRange(0.0f, 1.0f) < 0.35f);
+            if (spawnLeft) {
+                f.x = RandRange(-20.0f, -2.0f);
+                f.y = RandRange(0.0f, static_cast<float>(height_) * 0.85f);
+            } else {
+                f.x = RandRange(0.0f, static_cast<float>(width_));
+                f.y = randomY ? RandRange(0.0f, static_cast<float>(height_)) : RandRange(-20.0f, -2.0f);
+            }
+            f.vx = RandRange(40.0f, 95.0f);
+            f.vy = RandRange(75.0f, 145.0f);
+            f.r = RandRange(1.8f, 4.1f);
+            f.depositAmt = 2.6f;
+        } else {
+            // Severe blizzard: strong blowing crosswind + dense flakes from top & upwind edge
+            bool spawnLeft = !randomY && (RandRange(0.0f, 1.0f) < 0.50f);
+            if (spawnLeft) {
+                f.x = RandRange(-24.0f, -2.0f);
+                f.y = RandRange(0.0f, static_cast<float>(height_) * 0.90f);
+            } else {
+                f.x = RandRange(0.0f, static_cast<float>(width_));
+                f.y = randomY ? RandRange(0.0f, static_cast<float>(height_)) : RandRange(-24.0f, -2.0f);
+            }
+            f.vx = RandRange(130.0f, 245.0f);
+            f.vy = RandRange(120.0f, 215.0f);
+            f.r = RandRange(1.6f, 4.6f);
+            f.depositAmt = 3.4f;
+        }
         return f;
     }
 
@@ -857,11 +1002,12 @@ private:
 
     void SpillWindowSnow(WindowSurface& surf, float dx, float dy) {
         bool hadSnow = false;
+        size_t maxFlakes = MaxFlakeCount();
         for (size_t i = 0; i < surf.heights.size(); ++i) {
             float h = surf.heights[i];
             if (h > 1.5f) {
                 hadSnow = true;
-                if (i % 2 == 0 && flakes_.size() < 260) {
+                if (i % 2 == 0 && flakes_.size() < maxFlakes) {
                     Flake f;
                     f.x = surf.rect.Left() + static_cast<float>(i * BUCKET_W) + RandRange(-2.0f, 2.0f);
                     f.y = surf.rect.Top() - RandRange(0.0f, h);
@@ -939,6 +1085,7 @@ private:
                 float dy = r.y - s.rect.y;
                 if (std::abs(dx) > 2.0f || std::abs(dy) > 2.0f || std::abs(r.w - s.rect.w) > 2.0f) {
                     SpillWindowSnow(s, dx, dy);
+                    if (!isTB) MarkBallsOnWindowAsFalling(s.hwnd);
                     s.rect = r;
                     s.idleTime = 0.0f;
                     s.EnsureBuckets();
@@ -952,9 +1099,11 @@ private:
             }
         }
 
+        // Closed, minimized, or occluded windows spill snow & drop snowballs/snowmen
         for (auto it = surfaces_.begin(); it != surfaces_.end(); ) {
             if (activeSet.find(it->first) == activeSet.end()) {
                 SpillWindowSnow(it->second, 0.0f, 15.0f);
+                if (!it->second.isTaskbar) MarkBallsOnWindowAsFalling(it->first);
                 it = surfaces_.erase(it);
             } else {
                 ++it;
@@ -1077,7 +1226,8 @@ private:
 
     // --- Snowball Splat, Snowdust & Collapse ---
     void SplatSnowball(const Snowball& b) {
-        for (int i = 0; i < 12; ++i) {
+        size_t maxFlakes = MaxFlakeCount();
+        for (int i = 0; i < 12 && flakes_.size() < maxFlakes; ++i) {
             float ang = RandRange(0.0f, 2.0f * PI_F);
             float spd = RandRange(70.0f, 250.0f);
             Flake f;
@@ -1109,7 +1259,8 @@ private:
                 RandInt(0, 2) == 0
             });
         }
-        for (int i = 0; i < 6 && flakes_.size() < 240; ++i) {
+        size_t maxFlakes = MaxFlakeCount();
+        for (int i = 0; i < 6 && flakes_.size() < maxFlakes; ++i) {
             float ang = RandRange(0.0f, 2.0f * PI_F);
             float spd = RandRange(45.0f, 140.0f);
             Flake f;
@@ -1122,6 +1273,22 @@ private:
             f.canDeposit = true;
             f.depositAmt = 1.4f;
             flakes_.push_back(f);
+        }
+    }
+
+    void DestroyBallOrSnowmanIntoDust(size_t idx, std::vector<bool>& dead) {
+        if (idx >= snowballs_.size() || dead[idx]) return;
+        const auto& b = snowballs_[idx];
+        BurstIntoSnowdust(b);
+        dead[idx] = true;
+
+        int childIdx = FindStackedChildIndex(b.id);
+        if (childIdx >= 0 && !dead[childIdx]) {
+            auto& head = snowballs_[childIdx];
+            head.x = b.x;
+            head.y = b.y - (b.r + head.r - 3.0f);
+            BurstIntoSnowdust(head);
+            dead[childIdx] = true;
         }
     }
 
@@ -1145,6 +1312,8 @@ private:
             b.collapseTimer = timer;
             b.grabbed = false;
             b.resting = false;
+            b.restingHwnd = nullptr;
+            b.fellFromWindow = false;
             b.stackedOnId = -1;
             b.stackLevel = 0;
             b.aligning = false;
@@ -1261,6 +1430,7 @@ private:
     }
 
     void UpdateFlakes(float dt) {
+        size_t maxFlakes = MaxFlakeCount();
         if (snowfallActive_) {
             size_t ambientCount = 0;
             for (const auto& f : flakes_) {
@@ -1268,8 +1438,8 @@ private:
             }
             size_t target = TargetAmbientCount();
             if (ambientCount < target) {
-                ambientSpawnAccum_ += dt * 14.0f;
-                while (ambientSpawnAccum_ >= 1.0f && ambientCount < target) {
+                ambientSpawnAccum_ += dt * AmbientSpawnRate();
+                while (ambientSpawnAccum_ >= 1.0f && ambientCount < target && flakes_.size() < maxFlakes) {
                     flakes_.push_back(MakeAmbientFlake(false));
                     ambientSpawnAccum_ -= 1.0f;
                     ++ambientCount;
@@ -1279,13 +1449,25 @@ private:
             ambientSpawnAccum_ = 0.0f;
         }
 
+        // Dynamic gusts for Moderate & Severe blizzards
+        float gustModerate = 68.0f + std::sin(elapsedSec_ * 0.9f) * 24.0f;
+        float gustSevere = 185.0f + std::sin(elapsedSec_ * 0.8f) * 55.0f + std::sin(elapsedSec_ * 2.1f) * 20.0f;
+
         std::vector<Flake> next;
         next.reserve(flakes_.size());
 
         for (auto& f : flakes_) {
             f.age += dt;
             if (f.ambient) {
-                f.vx = std::clamp(f.vx + std::sin(elapsedSec_ * 1.6f + f.y * 0.02f) * 9.0f * dt, -30.0f, 30.0f);
+                if (intensity_ == BlizzardIntensity::Light) {
+                    f.vx = std::clamp(f.vx + std::sin(elapsedSec_ * 1.6f + f.y * 0.02f) * 9.0f * dt, -30.0f, 30.0f);
+                } else if (intensity_ == BlizzardIntensity::Moderate) {
+                    float targetVx = gustModerate + std::sin(elapsedSec_ * 2.0f + f.y * 0.02f) * 16.0f;
+                    f.vx += (targetVx - f.vx) * std::min(1.0f, dt * 2.2f);
+                } else {
+                    float targetVx = gustSevere + std::sin(elapsedSec_ * 3.1f + f.y * 0.025f) * 32.0f;
+                    f.vx += (targetVx - f.vx) * std::min(1.0f, dt * 3.0f);
+                }
             } else {
                 f.vy += GRAVITY * 0.55f * dt;
                 f.vx *= 0.99f;
@@ -1308,7 +1490,7 @@ private:
                         if (idx >= 0 && idx < static_cast<int>(s.heights.size())) {
                             float edgeY = s.rect.Top() + CornerDropAt(s, localX);
                             float snowTop = edgeY - s.heights[idx];
-                            if (f.y >= snowTop - 6.0f && f.y <= edgeY + 10.0f) {
+                            if (f.y >= snowTop - 6.0f && f.y <= edgeY + 12.0f) {
                                 float maxHere = MaxSnowHeightAt(s, localX);
                                 if (!s.isTaskbar && maxHere < 1.2f) {
                                     int sideDir = (localX < s.rect.w * 0.5f) ? -1 : 1;
@@ -1340,11 +1522,11 @@ private:
                 }
             }
 
-            if (landed || f.y > height_ + 20 || f.x < -40 || f.x > width_ + 40) {
-                if (f.ambient && snowfallActive_) {
+            if (landed || f.y > height_ + 20 || f.x < -50 || f.x > width_ + 50) {
+                if (f.ambient && snowfallActive_ && next.size() < maxFlakes) {
                     next.push_back(MakeAmbientFlake(false));
                 }
-            } else if (next.size() < 240) {
+            } else if (next.size() < maxFlakes) {
                 next.push_back(f);
             }
         }
@@ -1472,6 +1654,8 @@ private:
                 b.vx = pl.dir * RandRange(240.0f, 440.0f);
                 b.vy = -RandRange(280.0f, 480.0f);
                 b.resting = false;
+                b.restingHwnd = nullptr;
+                b.fellFromWindow = !pl.isTaskbarPlow;
                 b.stackLevel = 0;
                 b.stackedOnId = -1;
                 b.aligning = false;
@@ -1481,6 +1665,7 @@ private:
     }
 
     void UpdatePlows(float dt) {
+        size_t maxFlakes = MaxFlakeCount();
         std::vector<SnowPlow> alive;
         for (auto& pl : plows_) {
             auto it = pl.attachedHwnd ? surfaces_.find(pl.attachedHwnd) : surfaces_.end();
@@ -1498,7 +1683,7 @@ private:
                         float cleared = s.heights[k];
                         s.heights[k] = 0.0f;
                         pl.moundMass = std::min(28.0f, pl.moundMass + cleared * 0.14f);
-                        if (RandRange(0.0f, 1.0f) < 0.30f && flakes_.size() < 240) {
+                        if (RandRange(0.0f, 1.0f) < 0.30f && flakes_.size() < maxFlakes) {
                             Flake f;
                             f.x = s.rect.Left() + static_cast<float>(k * BUCKET_W);
                             f.y = s.rect.Top() - RandRange(2.0f, std::max(4.0f, cleared));
@@ -1518,7 +1703,7 @@ private:
                 bool offLeft = (pl.dir == -1 && pl.x < s.rect.Left() - 14.0f);
                 if (offRight || offLeft) {
                     int clumps = static_cast<int>(pl.moundMass);
-                    for (int c = 0; c < clumps && flakes_.size() < 240; ++c) {
+                    for (int c = 0; c < clumps && flakes_.size() < maxFlakes; ++c) {
                         Flake f;
                         f.x = bladeX + RandRange(-6.0f, 6.0f);
                         f.y = pl.y - RandRange(2.0f, std::max(6.0f, pl.moundMass));
@@ -1571,9 +1756,25 @@ private:
 
         for (size_t i = 0; i < snowballs_.size(); ++i) {
             auto& b = snowballs_[i];
-            if (b.grabbed) continue;
+            if (dead[i] || b.grabbed) continue;
             if (b.stackedOnId >= 0 && !b.collapsing) continue;
 
+            // Detect if a snowball rolled off or lost the app window underneath it
+            if (b.restingHwnd != nullptr && b.restingHwnd != TASKBAR_KEY) {
+                auto rit = surfaces_.find(b.restingHwnd);
+                bool stillOnWin = (rit != surfaces_.end() &&
+                                   b.x >= rit->second.rect.Left() &&
+                                   b.x <= rit->second.rect.Right() &&
+                                   std::abs((b.y + b.r) - rit->second.rect.Top()) <= 14.0f);
+                if (!stillOnWin) {
+                    b.fellFromWindow = true;
+                    b.restingHwnd = nullptr;
+                    int childIdx = FindStackedChildIndex(b.id);
+                    if (childIdx >= 0) snowballs_[childIdx].fellFromWindow = true;
+                }
+            }
+
+            float prevBottom = b.y + b.r;
             b.vy += GRAVITY * dt;
             b.x += b.vx * dt;
             b.y += b.vy * dt;
@@ -1592,7 +1793,7 @@ private:
                         const auto& s = it->second;
                         if (b.x >= s.rect.Left() && b.x <= s.rect.Right()) {
                             float sy = s.rect.Top();
-                            if (b.y + b.r >= sy - 4.0f && b.y + b.r <= sy + 24.0f) {
+                            if (prevBottom <= sy + 12.0f && (b.y + b.r) >= sy - 4.0f) {
                                 b.y = sy - b.r;
                                 hitFloor = true;
                                 break;
@@ -1618,21 +1819,31 @@ private:
                 }
             }
 
+            // Swept surface collision so fast falls never tunnel past lower windows or the taskbar
             for (HWND h : zOrder_) {
                 auto it = surfaces_.find(h);
                 if (it == surfaces_.end()) continue;
                 const auto& s = it->second;
                 if (b.x >= s.rect.Left() && b.x <= s.rect.Right()) {
                     float sy = s.rect.Top();
-                    if (b.vy >= 0.0f && b.y + b.r >= sy - 6.0f && b.y + b.r <= sy + 24.0f) {
-                        if (std::hypot(b.vx, b.vy) > 540.0f) {
+                    if (b.vy >= 0.0f && prevBottom <= sy + 12.0f && (b.y + b.r) >= sy - 6.0f) {
+                        if (s.isTaskbar && b.fellFromWindow) {
+                            // Fell from an app window onto the taskbar -> shatter into snowdust!
+                            b.y = sy - b.r;
+                            DestroyBallOrSnowmanIntoDust(i, dead);
+                        } else if (!b.fellFromWindow && std::hypot(b.vx, b.vy) > 540.0f) {
                             SplatSnowball(b);
                             dead[i] = true;
                         } else {
+                            // Landed intact (including window-to-window drops!)
                             b.y = sy - b.r;
                             b.vy = (std::abs(b.vy) > 90.0f) ? -b.vy * 0.22f : 0.0f;
                             b.resting = (b.vy == 0.0f);
                             b.vx *= 0.80f;
+                            b.restingHwnd = s.hwnd;
+                            b.fellFromWindow = false;
+                            int childIdx = FindStackedChildIndex(b.id);
+                            if (childIdx >= 0) snowballs_[childIdx].fellFromWindow = false;
                         }
                         break;
                     }
@@ -1641,9 +1852,14 @@ private:
 
             if (!dead[i] && b.y + b.r > static_cast<float>(height_)) {
                 b.y = static_cast<float>(height_) - b.r;
-                b.vy = 0.0f;
-                b.vx *= 0.80f;
-                b.resting = true;
+                if (b.fellFromWindow) {
+                    DestroyBallOrSnowmanIntoDust(i, dead);
+                } else {
+                    b.vy = 0.0f;
+                    b.vx *= 0.80f;
+                    b.resting = true;
+                    b.restingHwnd = hasBottomTaskbar_ ? TASKBAR_KEY : nullptr;
+                }
             }
         }
 
@@ -1677,6 +1893,8 @@ private:
             head.vx = 0.0f;
             head.vy = 0.0f;
             head.resting = body.resting;
+            head.restingHwnd = body.restingHwnd;
+            head.fellFromWindow = body.fellFromWindow;
             head.stackLevel = 1;
 
             if (std::abs(head.alignAngle) < 0.25f) {
@@ -1735,6 +1953,8 @@ private:
                             a.vx = 0.0f;
                             a.vy = 0.0f;
                             a.resting = true;
+                            a.restingHwnd = b.restingHwnd;
+                            a.fellFromWindow = b.fellFromWindow;
                             a.snowmanReveal = 0.0f;
                             b.vx *= 0.15f;
                             break;
@@ -2130,8 +2350,13 @@ private:
         if (santa_.active) DrawSanta(g);
 
         SolidBrush flakeBr(Color(225, 255, 255, 255));
+        bool stretchWind = (intensity_ == BlizzardIntensity::Severe);
         for (const auto& f : flakes_) {
-            g.FillEllipse(&flakeBr, f.x - f.r, f.y - f.r, f.r * 2.0f, f.r * 2.0f);
+            if (stretchWind && f.ambient) {
+                g.FillEllipse(&flakeBr, f.x - f.r * 1.35f, f.y - f.r * 0.85f, f.r * 2.7f, f.r * 1.7f);
+            } else {
+                g.FillEllipse(&flakeBr, f.x - f.r, f.y - f.r, f.r * 2.0f, f.r * 2.0f);
+            }
         }
         g.ResetClip();
 
@@ -2157,6 +2382,8 @@ private:
             if (std::hypot(mx - b.x, my - b.y) <= b.r + 7.0f) {
                 b.grabbed = true;
                 b.resting = false;
+                b.restingHwnd = nullptr;
+                b.fellFromWindow = false;
                 b.stackLevel = 0;
                 b.stackedOnId = -1;
                 b.aligning = false;
@@ -2169,6 +2396,8 @@ private:
                     c.aligning = false;
                     c.snowmanReveal = 0.0f;
                     c.resting = false;
+                    c.restingHwnd = nullptr;
+                    c.fellFromWindow = false;
                 }
                 draggedBallId_ = b.id;
                 SetCapture(hwnd_);
@@ -2252,9 +2481,19 @@ private:
             : (L"Custom (" + FormatIdleDuration(idleDelaySec_) + L")...");
         AppendMenuW(idleSub, MF_STRING | (!isPreset ? MF_CHECKED : 0), ID_IDLE_CUSTOM, customLabel.c_str());
 
+        HMENU intensitySub = CreatePopupMenu();
+        AppendMenuW(intensitySub, MF_STRING | (intensity_ == BlizzardIntensity::Light ? MF_CHECKED : 0),
+                    ID_INTENSITY_LIGHT, L"Light (Default)");
+        AppendMenuW(intensitySub, MF_STRING | (intensity_ == BlizzardIntensity::Moderate ? MF_CHECKED : 0),
+                    ID_INTENSITY_MODERATE, L"Moderate");
+        AppendMenuW(intensitySub, MF_STRING | (intensity_ == BlizzardIntensity::Severe ? MF_CHECKED : 0),
+                    ID_INTENSITY_SEVERE, L"Severe");
+
         HMENU menu = CreatePopupMenu();
         std::wstring idleTitle = L"Idle Timer (" + FormatIdleDuration(idleDelaySec_) + L")";
+        std::wstring intensityTitle = std::wstring(L"Blizzard Intensity (") + IntensityLabel(intensity_) + L")";
         AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(idleSub), idleTitle.c_str());
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(intensitySub), intensityTitle.c_str());
         AppendMenuW(menu, MF_STRING | (forceSnowfall_ ? MF_CHECKED : 0), ID_TRAY_FORCE_SNOW, L"Force Snowfall (Skip Idle)");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, ID_TRAY_PLOW_WIN, L"Plow Top Window");
@@ -2273,7 +2512,7 @@ private:
         SetForegroundWindow(hwnd_);
         UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd_, nullptr);
         PostMessageW(hwnd_, WM_NULL, 0, 0);
-        DestroyMenu(menu); // Also destroys idleSub
+        DestroyMenu(menu); // Also destroys submenus
 
         switch (cmd) {
         case ID_IDLE_0: ApplyIdleDelay(0); break;
@@ -2283,6 +2522,9 @@ private:
         case ID_IDLE_300: ApplyIdleDelay(300); break;
         case ID_IDLE_600: ApplyIdleDelay(600); break;
         case ID_IDLE_CUSTOM: ShowCustomIdleDialog(); break;
+        case ID_INTENSITY_LIGHT: ApplyBlizzardIntensity(BlizzardIntensity::Light); break;
+        case ID_INTENSITY_MODERATE: ApplyBlizzardIntensity(BlizzardIntensity::Moderate); break;
+        case ID_INTENSITY_SEVERE: ApplyBlizzardIntensity(BlizzardIntensity::Severe); break;
         case ID_TRAY_FORCE_SNOW:
             forceSnowfall_ = !forceSnowfall_;
             RefreshSnowfallActive(GetGlobalIdleSeconds());
